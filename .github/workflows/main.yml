@@ -1,0 +1,30 @@
+name: Smoke Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install torch numpy tiktoken requests
+        
+    - name: Run smoke test (5 iterations)
+      run: |
+        python -c "from train import train; train(max_iters=5, eval_interval=5, use_compile=False, use_amp=False, device='cpu')"
+
