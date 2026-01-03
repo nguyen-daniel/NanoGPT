@@ -49,13 +49,9 @@ logs/
 wandb/
 
 # Data files
-# Keep data/ directory structure but ignore generated files
-data/*.pt
-data/train.pt
-data/val.pt
-data/vocab.pt
-# Uncomment to ignore the entire data directory:
-# data/
+# Ignore the entire data directory (raw dataset and processed files)
+# Users can regenerate by running: python data.py
+data/
 
 # Jupyter Notebook
 .ipynb_checkpoints
