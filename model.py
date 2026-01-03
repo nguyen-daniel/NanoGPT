@@ -1,6 +1,8 @@
 """
 GPT model architecture for NanoGPT.
 Implements a decoder-only transformer following the GPT architecture.
+
+© 2026
 """
 
 import torch

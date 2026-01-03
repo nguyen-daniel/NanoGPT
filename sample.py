@@ -9,6 +9,58 @@ from pathlib import Path
 from model import GPT, GPTConfig
 
 
+def get_device(device=None):
+    """
+    Get the best available device for inference.
+    
+    Supports:
+    - CUDA (NVIDIA GPUs)
+    - ROCm (AMD GPUs) - accessed via 'cuda' device string
+    - MPS (Apple Silicon GPUs)
+    - CPU (fallback)
+    
+    Args:
+        device: Optional device string ('cuda', 'mps', 'cpu', or None for auto-detect)
+    
+    Returns:
+        Device string and device object
+    """
+    if device is None:
+        # Auto-detect best available device
+        if torch.cuda.is_available():
+            device = 'cuda'
+            gpu_name = torch.cuda.get_device_name(0)
+            
+            # Detect if it's an AMD GPU (ROCm) or NVIDIA GPU
+            is_amd = 'AMD' in gpu_name.upper() or 'Radeon' in gpu_name or 'ROCm' in str(torch.version.hip) if hasattr(torch.version, 'hip') else False
+            
+            if is_amd:
+                print(f"ROCm available: Using AMD GPU ({gpu_name})")
+            else:
+                print(f"CUDA available: Using NVIDIA GPU ({gpu_name})")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+            print("MPS available: Using Apple Silicon GPU")
+        else:
+            device = 'cpu'
+            print("Using CPU (no GPU available)")
+    else:
+        # Validate requested device
+        if device == 'cuda' and not torch.cuda.is_available():
+            print("Warning: CUDA/ROCm requested but not available. Falling back to CPU.")
+            print("Note: For AMD GPUs, install PyTorch with ROCm support:")
+            print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7")
+            device = 'cpu'
+        elif device == 'mps' and (not hasattr(torch.backends, 'mps') or not torch.backends.mps.is_available()):
+            print("Warning: MPS requested but not available. Falling back to CPU.")
+            device = 'cpu'
+        elif device not in ['cuda', 'mps', 'cpu']:
+            print(f"Warning: Unknown device '{device}'. Using CPU.")
+            device = 'cpu'
+    
+    return device, torch.device(device)
+
+
 def load_checkpoint(checkpoint_path, device):
     """
     Load model checkpoint and configuration.
@@ -22,7 +74,9 @@ def load_checkpoint(checkpoint_path, device):
         config: GPTConfig used for the model
     """
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # weights_only=False is safe here since we trust our own checkpoints
+    # PyTorch 2.6+ defaults to weights_only=True for security
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Extract configuration
     config = checkpoint['config']
@@ -30,7 +84,24 @@ def load_checkpoint(checkpoint_path, device):
     
     # Initialize model
     model = GPT(config)
-    model.load_state_dict(checkpoint['model'])
+    
+    # Load state dict - handle both compiled and uncompiled checkpoints
+    state_dict = checkpoint['model']
+    
+    # If checkpoint was saved from a compiled model, strip '_orig_mod.' prefix
+    # torch.compile() wraps the model and adds this prefix to parameter names
+    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+        print("Detected compiled model checkpoint, stripping '_orig_mod.' prefix...")
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('_orig_mod.'):
+                new_key = key[len('_orig_mod.'):]
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        state_dict = new_state_dict
+    
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
     
@@ -55,7 +126,8 @@ def load_vocabulary(data_dir='data'):
         raise FileNotFoundError(f"Vocabulary file not found at {vocab_path}. Run data.py first.")
     
     print(f"Loading vocabulary from {vocab_path}...")
-    vocab_metadata = torch.load(vocab_path)
+    # weights_only=False is safe here since we trust our own vocabulary files
+    vocab_metadata = torch.load(vocab_path, weights_only=False)
     
     # Create encode and decode functions
     char_to_int = vocab_metadata['char_to_int']
@@ -82,7 +154,7 @@ def generate_text(
     temperature=1.0,
     top_k=None,
     data_dir='data',
-    device='cuda' if torch.cuda.is_available() else 'cpu'
+    device=None  # None = auto-detect, or specify 'cuda', 'mps', 'cpu'
 ):
     """
     Generate text from a prompt using a trained model.
@@ -94,15 +166,18 @@ def generate_text(
         temperature: Sampling temperature (1.0 = default, >1.0 = more random, <1.0 = more focused)
         top_k: If specified, only sample from top-k most likely tokens
         data_dir: Directory containing vocabulary data
-        device: Device to run generation on
+        device: Device to run generation on (None = auto-detect, 'cuda', 'mps', or 'cpu')
     """
+    # Determine device
+    device_str, device_obj = get_device(device)
+    
     # Load vocabulary
     vocab = load_vocabulary(data_dir)
     encode = vocab['encode']
     decode = vocab['decode']
     
     # Load model
-    model, config = load_checkpoint(checkpoint_path, device)
+    model, config = load_checkpoint(checkpoint_path, device_obj)
     
     # Encode the prompt
     print(f"\nPrompt: {repr(prompt)}")
@@ -110,7 +185,7 @@ def generate_text(
     print(f"Prompt length: {len(prompt_tokens)} tokens")
     
     # Convert to tensor
-    idx = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+    idx = torch.tensor([prompt_tokens], dtype=torch.long, device=device_obj)
     
     # Generate new tokens
     print(f"\nGenerating {num_tokens} new tokens...")
@@ -154,10 +229,6 @@ if __name__ == '__main__':
                         help='Device to use (cuda/cpu, default: auto-detect)')
     
     args = parser.parse_args()
-    
-    # Auto-detect device if not specified
-    if args.device is None:
-        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     generate_text(
         checkpoint_path=args.checkpoint,

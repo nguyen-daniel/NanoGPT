@@ -28,3 +28,9 @@ jobs:
       run: |
         python -c "from train import train; train(max_iters=5, eval_interval=5, use_compile=False, use_amp=False, device='cpu')"
 
+
+
+
+
+
+

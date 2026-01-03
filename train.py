@@ -14,6 +14,62 @@ from model import GPT, GPTConfig
 from data import prepare_data
 
 
+def get_device(device=None):
+    """
+    Get the best available device for training.
+    
+    Supports:
+    - CUDA (NVIDIA GPUs)
+    - ROCm (AMD GPUs) - accessed via 'cuda' device string
+    - MPS (Apple Silicon GPUs)
+    - CPU (fallback)
+    
+    Args:
+        device: Optional device string ('cuda', 'mps', 'cpu', or None for auto-detect)
+    
+    Returns:
+        Device string and device object
+    """
+    if device is None:
+        # Auto-detect best available device
+        if torch.cuda.is_available():
+            device = 'cuda'
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+            
+            # Detect if it's an AMD GPU (ROCm) or NVIDIA GPU
+            # ROCm devices typically show up with AMD in the name or via backend
+            is_amd = 'AMD' in gpu_name.upper() or 'Radeon' in gpu_name or 'ROCm' in str(torch.version.hip) if hasattr(torch.version, 'hip') else False
+            
+            if is_amd:
+                print(f"ROCm available: Using AMD GPU ({gpu_name})")
+                print(f"GPU Memory: {gpu_memory:.2f} GB")
+            else:
+                print(f"CUDA available: Using NVIDIA GPU ({gpu_name})")
+                print(f"GPU Memory: {gpu_memory:.2f} GB")
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+            print("MPS available: Using Apple Silicon GPU")
+        else:
+            device = 'cpu'
+            print("Using CPU (no GPU available)")
+    else:
+        # Validate requested device
+        if device == 'cuda' and not torch.cuda.is_available():
+            print("Warning: CUDA/ROCm requested but not available. Falling back to CPU.")
+            print("Note: For AMD GPUs, install PyTorch with ROCm support:")
+            print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7")
+            device = 'cpu'
+        elif device == 'mps' and (not hasattr(torch.backends, 'mps') or not torch.backends.mps.is_available()):
+            print("Warning: MPS requested but not available. Falling back to CPU.")
+            device = 'cpu'
+        elif device not in ['cuda', 'mps', 'cpu']:
+            print(f"Warning: Unknown device '{device}'. Using CPU.")
+            device = 'cpu'
+    
+    return device, torch.device(device)
+
+
 def get_batch(data, block_size, batch_size, device):
     """
     Sample a random batch of data for training.
@@ -120,7 +176,7 @@ def train(
     min_lr=0.1,
     eval_interval=500,
     eval_iters=200,
-    device='cuda' if torch.cuda.is_available() else 'cpu',
+    device=None,  # None = auto-detect, or specify 'cuda', 'mps', 'cpu'
     out_dir='out',
     use_compile=True,
     use_amp=True
@@ -141,11 +197,20 @@ def train(
         min_lr: Minimum learning rate (as fraction of max_lr)
         eval_interval: Evaluate and print loss every N iterations
         eval_iters: Number of iterations to average loss over during evaluation
-        device: Device to train on ('cuda' or 'cpu')
+        device: Device to train on (None = auto-detect, 'cuda', 'mps', or 'cpu')
         out_dir: Directory to save checkpoints
-        use_compile: Whether to use torch.compile (only on Linux)
-        use_amp: Whether to use automatic mixed precision training
+        use_compile: Whether to use torch.compile (only on Linux with CUDA)
+        use_amp: Whether to use automatic mixed precision training (CUDA only)
     """
+    # Determine device
+    device_str, device_obj = get_device(device)
+    
+    # Check if AMD GPU for later use
+    is_amd_gpu = False
+    if device_str == 'cuda' and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        is_amd_gpu = 'AMD' in gpu_name.upper() or 'Radeon' in gpu_name or (hasattr(torch.version, 'hip') and 'ROCm' in str(torch.version.hip))
+    
     # Load data
     print("Loading data...")
     data_path = Path(data_dir)
@@ -181,35 +246,38 @@ def train(
         n_embd=n_embd
     )
     model = GPT(config)
-    model = model.to(device)
+    model = model.to(device_obj)
     
     # Print model parameters
     n_params = model.get_num_params() / 1e6
     print(f"Model initialized with {n_params:.2f}M parameters")
     
     # Apply torch.compile if on Linux and requested
-    if use_compile and platform.system() == 'Linux' and device == 'cuda':
+    if use_compile and platform.system() == 'Linux' and device_str == 'cuda':
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
         print("Model compiled successfully")
     elif use_compile and platform.system() != 'Linux':
         print("Warning: torch.compile is only supported on Linux. Skipping compilation.")
-    elif use_compile and device != 'cuda':
+    elif use_compile and device_str != 'cuda':
         print("Warning: torch.compile is most effective on CUDA. Skipping compilation.")
     
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     # Mixed precision scaler (only needed for CUDA)
-    scaler = torch.cuda.amp.GradScaler() if (use_amp and device == 'cuda') else None
+    scaler = torch.cuda.amp.GradScaler() if (use_amp and device_str == 'cuda') else None
     
     # Training loop
-    print(f"\nStarting training on {device}...")
+    print(f"\nStarting training on {device_str.upper()}...")
+    if device_str == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Max iterations: {max_iters}")
     print(f"Warmup iterations: {warmup_iters}")
     print(f"Evaluation interval: {eval_interval} iterations")
-    if use_amp and device == 'cuda':
-        print("Using mixed-precision training (FP16)")
+    if use_amp and device_str == 'cuda':
+        gpu_type = "AMD GPU (ROCm)" if is_amd_gpu else "NVIDIA GPU"
+        print(f"Using mixed-precision training (FP16) on {gpu_type}")
     print("-" * 60)
     
     best_val_loss = float('inf')
@@ -222,10 +290,10 @@ def train(
             param_group['lr'] = lr
         
         # Sample a batch of data
-        x, y = get_batch(train_data, block_size, batch_size, device)
+        x, y = get_batch(train_data, block_size, batch_size, device_obj)
         
         # Forward and backward pass with mixed precision if enabled
-        if use_amp and device == 'cuda' and scaler is not None:
+        if use_amp and device_str == 'cuda' and scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits, loss = model(x, y)
@@ -244,7 +312,7 @@ def train(
         
         # Evaluate periodically
         if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device, use_amp and device == 'cuda')
+            losses = estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, use_amp and device_str == 'cuda')
             current_lr = optimizer.param_groups[0]['lr']
             print(f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
             
@@ -272,24 +340,61 @@ def train(
 
 
 if __name__ == '__main__':
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train NanoGPT model')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda/mps/cpu, default: auto-detect)')
+    parser.add_argument('--data_dir', type=str, default='data',
+                        help='Directory containing processed data (default: data)')
+    parser.add_argument('--block_size', type=int, default=256,
+                        help='Context length (default: 256)')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size (default: 64)')
+    parser.add_argument('--n_layer', type=int, default=6,
+                        help='Number of transformer layers (default: 6)')
+    parser.add_argument('--n_head', type=int, default=6,
+                        help='Number of attention heads (default: 6)')
+    parser.add_argument('--n_embd', type=int, default=384,
+                        help='Embedding dimension (default: 384)')
+    parser.add_argument('--learning_rate', type=float, default=3e-4,
+                        help='Maximum learning rate (default: 3e-4)')
+    parser.add_argument('--max_iters', type=int, default=5000,
+                        help='Maximum training iterations (default: 5000)')
+    parser.add_argument('--warmup_iters', type=int, default=100,
+                        help='Warmup iterations (default: 100)')
+    parser.add_argument('--min_lr', type=float, default=0.1,
+                        help='Minimum learning rate as fraction of max_lr (default: 0.1)')
+    parser.add_argument('--eval_interval', type=int, default=500,
+                        help='Evaluate every N iterations (default: 500)')
+    parser.add_argument('--eval_iters', type=int, default=200,
+                        help='Number of iterations to average loss over (default: 200)')
+    parser.add_argument('--out_dir', type=str, default='out',
+                        help='Output directory for checkpoints (default: out)')
+    parser.add_argument('--no_compile', action='store_true',
+                        help='Disable torch.compile (Linux CUDA only)')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable mixed-precision training (CUDA only)')
+    
+    args = parser.parse_args()
+    
     # Training hyperparameters
-    # These are reasonable defaults for a small model on Shakespeare
     train(
-        data_dir='data',
-        block_size=256,      # Context length
-        batch_size=64,       # Batch size
-        n_layer=6,           # Number of transformer layers
-        n_head=6,            # Number of attention heads
-        n_embd=384,          # Embedding dimension
-        learning_rate=3e-4,  # Maximum learning rate
-        max_iters=5000,      # Maximum training iterations
-        warmup_iters=100,    # Warmup iterations for learning rate
-        min_lr=0.1,          # Minimum learning rate (as fraction of max_lr)
-        eval_interval=500,   # Evaluate every N iterations
-        eval_iters=200,      # Number of iterations to average loss over
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        out_dir='out',
-        use_compile=True,   # Use torch.compile (Linux only)
-        use_amp=True        # Use mixed-precision training
+        data_dir=args.data_dir,
+        block_size=args.block_size,
+        batch_size=args.batch_size,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        n_embd=args.n_embd,
+        learning_rate=args.learning_rate,
+        max_iters=args.max_iters,
+        warmup_iters=args.warmup_iters,
+        min_lr=args.min_lr,
+        eval_interval=args.eval_interval,
+        eval_iters=args.eval_iters,
+        device=args.device,  # Auto-detect if None
+        out_dir=args.out_dir,
+        use_compile=not args.no_compile,
+        use_amp=not args.no_amp
     )
 

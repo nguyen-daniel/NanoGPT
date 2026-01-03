@@ -1,6 +1,8 @@
 """
 Data preparation script for NanoGPT.
 Downloads and processes the Tiny Shakespeare dataset for character-level language modeling.
+
+© 2026
 """
 
 import os
