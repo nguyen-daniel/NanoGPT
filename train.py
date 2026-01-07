@@ -189,7 +189,8 @@ def train(
     use_compile=True,
     use_amp=True,
     resume=False,
-    use_tensorboard=False
+    use_tensorboard=False,
+    use_flash_attn=True
 ):
     """
     Main training function.
@@ -213,6 +214,7 @@ def train(
         use_amp: Whether to use automatic mixed precision training (CUDA only)
         resume: Whether to resume training from the latest checkpoint
         use_tensorboard: Whether to log metrics to TensorBoard
+        use_flash_attn: Whether to use Flash Attention (PyTorch SDPA) for memory efficiency
     """
     # Determine device
     device_str, device_obj = get_device(device)
@@ -266,7 +268,8 @@ def train(
         vocab_size=vocab_size,
         n_layer=n_layer,
         n_head=n_head,
-        n_embd=n_embd
+        n_embd=n_embd,
+        use_flash_attn=use_flash_attn
     )
     model = GPT(config)
     model = model.to(device_obj)
@@ -274,6 +277,15 @@ def train(
     # Print model parameters
     n_params = model.get_num_params() / 1e6
     print(f"Model initialized with {n_params:.2f}M parameters")
+    
+    # Report Flash Attention status
+    from model import FLASH_ATTN_AVAILABLE
+    if use_flash_attn and FLASH_ATTN_AVAILABLE:
+        print("Flash Attention enabled (PyTorch SDPA)")
+    elif use_flash_attn and not FLASH_ATTN_AVAILABLE:
+        print("Flash Attention requested but not available (requires PyTorch 2.0+)")
+    else:
+        print("Flash Attention disabled (using manual attention)")
     
     # Apply torch.compile if on Linux and requested
     if use_compile and platform.system() == 'Linux' and device_str == 'cuda':
@@ -450,6 +462,8 @@ if __name__ == '__main__':
                         help='Disable torch.compile (Linux CUDA only)')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed-precision training (CUDA only)')
+    parser.add_argument('--no_flash_attn', action='store_true',
+                        help='Disable Flash Attention (PyTorch SDPA)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from the latest checkpoint')
     parser.add_argument('--tensorboard', action='store_true',
@@ -476,6 +490,7 @@ if __name__ == '__main__':
         use_compile=not args.no_compile,
         use_amp=not args.no_amp,
         resume=args.resume,
-        use_tensorboard=args.tensorboard
+        use_tensorboard=args.tensorboard,
+        use_flash_attn=not args.no_flash_attn
     )
 

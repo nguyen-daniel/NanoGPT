@@ -7,7 +7,11 @@ Implements a decoder-only transformer following the GPT architecture.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from dataclasses import dataclass
+
+# Check if Flash Attention is available via PyTorch's scaled_dot_product_attention
+FLASH_ATTN_AVAILABLE = hasattr(F, 'scaled_dot_product_attention')
 
 
 @dataclass
@@ -21,12 +25,14 @@ class GPTConfig:
         n_layer: Number of transformer decoder layers
         n_head: Number of attention heads in multi-head attention
         n_embd: Embedding dimension (size of token embeddings)
+        use_flash_attn: Whether to use Flash Attention (PyTorch SDPA)
     """
     block_size: int = 1024  # context length
     vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12  # number of transformer blocks
     n_head: int = 12  # number of attention heads
     n_embd: int = 768  # embedding dimension
+    use_flash_attn: bool = True  # use Flash Attention via PyTorch SDPA when available
 
 
 class CausalSelfAttention(nn.Module):
@@ -35,6 +41,9 @@ class CausalSelfAttention(nn.Module):
     
     Implements scaled dot-product attention with a causal mask to prevent
     the model from looking at future tokens during autoregressive generation.
+    
+    When Flash Attention is enabled and available (PyTorch 2.0+), uses
+    F.scaled_dot_product_attention for better memory efficiency and speed.
     """
     
     def __init__(self, config: GPTConfig):
@@ -51,6 +60,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_size = config.n_embd // config.n_head
+        self.dropout = 0.1
+        
+        # Determine if we should use Flash Attention
+        self.use_flash_attn = config.use_flash_attn and FLASH_ATTN_AVAILABLE
         
         # Key, Query, Value projections for all heads
         # We use a single linear layer and split it into heads
@@ -59,14 +72,15 @@ class CausalSelfAttention(nn.Module):
         # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         
-        # Dropout for regularization
-        self.attn_dropout = nn.Dropout(0.1)
-        self.resid_dropout = nn.Dropout(0.1)
+        # Dropout for regularization (only used in manual attention path)
+        self.attn_dropout = nn.Dropout(self.dropout)
+        self.resid_dropout = nn.Dropout(self.dropout)
         
         # Causal mask: prevents attention to future positions
-        # Register as buffer so it's not a trainable parameter
-        self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
-                                      .view(1, 1, config.block_size, config.block_size))
+        # Only needed for manual attention (Flash Attention has built-in causal masking)
+        if not self.use_flash_attn:
+            self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
+                                          .view(1, 1, config.block_size, config.block_size))
     
     def forward(self, x):
         """
@@ -100,22 +114,34 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         v = v.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         
-        # Scaled dot-product attention
-        # Compute attention scores: Q @ K^T / sqrt(head_size)
-        # Shape: (batch_size, n_head, seq_len, seq_len)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_size ** 0.5))
-        
-        # Apply causal mask: set future positions to -inf
-        # The mask has 1s for positions we can attend to, 0s for positions we cannot
-        att = att.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float('-inf'))
-        
-        # Softmax to get attention weights
-        att = torch.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
-        
-        # Apply attention to values
-        # Shape: (batch_size, n_head, seq_len, head_size)
-        y = att @ v
+        if self.use_flash_attn:
+            # Flash Attention via PyTorch's scaled_dot_product_attention
+            # This is significantly more memory efficient and faster for long sequences
+            # is_causal=True handles the causal masking internally
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            # Manual attention computation (fallback for older PyTorch versions)
+            # Scaled dot-product attention
+            # Compute attention scores: Q @ K^T / sqrt(head_size)
+            # Shape: (batch_size, n_head, seq_len, seq_len)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_size ** 0.5))
+            
+            # Apply causal mask: set future positions to -inf
+            # The mask has 1s for positions we can attend to, 0s for positions we cannot
+            att = att.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float('-inf'))
+            
+            # Softmax to get attention weights
+            att = torch.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            
+            # Apply attention to values
+            # Shape: (batch_size, n_head, seq_len, head_size)
+            y = att @ v
         
         # Concatenate heads
         # Shape: (batch_size, seq_len, n_head, head_size)

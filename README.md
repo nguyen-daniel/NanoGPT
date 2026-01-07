@@ -131,7 +131,9 @@ Starting training on CUDA...
 
 ### 1. Prepare the Dataset
 
-First, download and preprocess the Tiny Shakespeare dataset:
+#### Default: Tiny Shakespeare
+
+Download and preprocess the Tiny Shakespeare dataset:
 
 ```bash
 python data.py
@@ -142,6 +144,23 @@ This will:
 - Create vocabulary from unique characters
 - Generate `data/train.pt`, `data/val.pt`, and `data/vocab.pt`
 - Split data into 90% training and 10% validation sets
+
+#### Custom Dataset
+
+Train on your own text file:
+
+```bash
+# Prepare your custom dataset
+python data.py --input_file my_corpus.txt --data_dir my_data
+
+# Train on the custom data
+python train.py --data_dir my_data
+```
+
+Options:
+- `--input_file`: Path to your text file
+- `--data_dir`: Directory to save processed data (default: `data`)
+- `--train_split`: Fraction of data for training (default: `0.9`)
 
 ### 2. Train the Model
 
@@ -166,8 +185,17 @@ The training script supports various hyperparameters. You can modify them in `tr
 The script will:
 - Use cosine learning rate decay with linear warmup
 - Apply mixed-precision training (FP16) on CUDA if available
+- Use Flash Attention (PyTorch SDPA) for memory-efficient attention
 - Compile the model with `torch.compile` on Linux for faster training
 - Save checkpoints to `out/ckpt.pt` when validation loss improves
+
+#### Flash Attention
+
+Flash Attention is enabled by default on PyTorch 2.0+ for significant memory savings and faster training on long sequences. To disable:
+
+```bash
+python train.py --no_flash_attn
+```
 
 #### Resume Training
 
@@ -254,9 +282,12 @@ The model follows the standard GPT architecture:
 
 - **Clean, Modular Code**: Each component is well-separated and educational
 - **Efficient Training**: Mixed-precision training and torch.compile support for faster training
+- **Flash Attention**: Memory-efficient attention via PyTorch SDPA (2-4x memory reduction)
+- **Custom Datasets**: Train on any text file, not just Shakespeare
 - **Learning Rate Scheduling**: Cosine decay with linear warmup for stable training
-- **Checkpointing**: Saves best model based on validation loss
-- **Text Generation**: Autoregressive generation with temperature and top-k sampling
+- **Checkpointing**: Saves best model based on validation loss; supports resuming training
+- **TensorBoard Integration**: Visualize training metrics in real-time
+- **Text Generation**: Autoregressive generation with temperature, top-k, and top-p sampling
 
 ## Model Size
 
@@ -273,8 +304,6 @@ This is a small model suitable for educational purposes and can train on a singl
 - [ ] Add support for BPE (Byte Pair Encoding) tokenization
 - [ ] Implement gradient checkpointing for larger models
 - [ ] Add support for multi-GPU training (DDP)
-- [ ] Add Flash Attention via PyTorch SDPA
-- [ ] Custom dataset support
 
 ## References
 

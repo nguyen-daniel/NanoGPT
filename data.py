@@ -1,11 +1,20 @@
 """
 Data preparation script for NanoGPT.
-Downloads and processes the Tiny Shakespeare dataset for character-level language modeling.
+Supports custom text files or downloads the Tiny Shakespeare dataset for character-level language modeling.
+
+Usage:
+    # Default: Download and prepare Tiny Shakespeare
+    python data.py
+    
+    # Custom dataset: Prepare your own text file
+    python data.py --input_file my_corpus.txt
+    python data.py --input_file my_corpus.txt --data_dir my_data
 
 © 2026
 """
 
 import os
+import argparse
 import torch
 import requests
 from pathlib import Path
@@ -39,6 +48,28 @@ def download_shakespeare(data_dir='data'):
         print(f"Dataset already exists at {input_file}")
     
     return input_file
+
+
+def load_custom_file(input_file):
+    """
+    Load a custom text file for training.
+    
+    Args:
+        input_file: Path to the input text file
+        
+    Returns:
+        Path to the text file (validated)
+    
+    Raises:
+        FileNotFoundError: If the input file doesn't exist
+    """
+    input_path = Path(input_file)
+    
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+    
+    print(f"Using custom input file: {input_path}")
+    return input_path
 
 
 def get_vocabulary(text):
@@ -81,13 +112,14 @@ def create_encoder_decoder(vocab):
     return encode, decode
 
 
-def prepare_data(data_dir='data', train_split=0.9):
+def prepare_data(data_dir='data', train_split=0.9, input_file=None):
     """
     Main function to prepare the dataset.
     
     Args:
         data_dir: Directory to save/load data
         train_split: Fraction of data to use for training (default 0.9)
+        input_file: Path to custom text file (optional). If None, downloads Shakespeare.
         
     Returns:
         Dictionary containing:
@@ -98,12 +130,19 @@ def prepare_data(data_dir='data', train_split=0.9):
             - encode: Encoding function
             - decode: Decoding function
     """
-    # Download dataset
-    input_file = download_shakespeare(data_dir)
+    # Create data directory
+    data_path = Path(data_dir)
+    data_path.mkdir(exist_ok=True)
+    
+    # Get input file - either custom or download Shakespeare
+    if input_file is not None:
+        text_file = load_custom_file(input_file)
+    else:
+        text_file = download_shakespeare(data_dir)
     
     # Read text
     print("Reading text file...")
-    with open(input_file, 'r', encoding='utf-8') as f:
+    with open(text_file, 'r', encoding='utf-8') as f:
         text = f.read()
     
     print(f"Dataset contains {len(text):,} characters")
@@ -164,17 +203,31 @@ def prepare_data(data_dir='data', train_split=0.9):
 
 
 if __name__ == '__main__':
-    # Prepare the dataset
-    data = prepare_data()
+    parser = argparse.ArgumentParser(description='Prepare data for NanoGPT training')
+    parser.add_argument('--input_file', type=str, default=None,
+                        help='Path to custom text file (default: download Tiny Shakespeare)')
+    parser.add_argument('--data_dir', type=str, default='data',
+                        help='Directory to save processed data (default: data)')
+    parser.add_argument('--train_split', type=float, default=0.9,
+                        help='Fraction of data for training (default: 0.9)')
     
-    # Test encode/decode
+    args = parser.parse_args()
+    
+    # Prepare the dataset
+    data = prepare_data(
+        data_dir=args.data_dir,
+        train_split=args.train_split,
+        input_file=args.input_file
+    )
+    
+    # Test encode/decode with a sample from the actual corpus
     print("\n" + "="*50)
     print("Testing encode/decode functions:")
-    test_string = "Hello, World!"
+    # Use first 50 characters from the corpus for testing
+    test_string = data['decode'](data['train_data'][:50].tolist())
     encoded = data['encode'](test_string)
     decoded = data['decode'](encoded)
-    print(f"Original: {test_string}")
-    print(f"Encoded:  {encoded}")
-    print(f"Decoded:  {decoded}")
-    print(f"Match: {test_string == decoded}")
+    print(f"Sample text: {repr(test_string[:50])}")
+    print(f"Encoded length: {len(encoded)}")
+    print(f"Roundtrip match: {test_string == decoded}")
 
