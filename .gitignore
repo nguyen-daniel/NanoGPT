@@ -58,6 +58,7 @@ data/
 *.ipynb
 
 # IDE
+.cursor/
 .vscode/
 .idea/
 *.swp
