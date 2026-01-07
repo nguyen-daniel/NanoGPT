@@ -153,6 +153,7 @@ def generate_text(
     num_tokens=500,
     temperature=1.0,
     top_k=None,
+    top_p=None,
     data_dir='data',
     device=None  # None = auto-detect, or specify 'cuda', 'mps', 'cpu'
 ):
@@ -165,6 +166,7 @@ def generate_text(
         num_tokens: Number of new tokens to generate
         temperature: Sampling temperature (1.0 = default, >1.0 = more random, <1.0 = more focused)
         top_k: If specified, only sample from top-k most likely tokens
+        top_p: If specified, use nucleus sampling (keep tokens with cumulative prob >= top_p)
         data_dir: Directory containing vocabulary data
         device: Device to run generation on (None = auto-detect, 'cuda', 'mps', or 'cpu')
     """
@@ -195,7 +197,8 @@ def generate_text(
         idx,
         max_new_tokens=num_tokens,
         temperature=temperature,
-        top_k=top_k
+        top_k=top_k,
+        top_p=top_p
     )
     
     # Decode the generated tokens
@@ -223,6 +226,8 @@ if __name__ == '__main__':
                         help='Sampling temperature (default: 1.0)')
     parser.add_argument('--top_k', type=int, default=None,
                         help='Top-k sampling (default: None, no filtering)')
+    parser.add_argument('--top_p', type=float, default=None,
+                        help='Top-p (nucleus) sampling - keep tokens with cumulative prob >= p (default: None)')
     parser.add_argument('--data_dir', type=str, default='data',
                         help='Directory containing vocabulary data (default: data)')
     parser.add_argument('--device', type=str, default=None,
@@ -236,6 +241,7 @@ if __name__ == '__main__':
         num_tokens=args.num_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
         data_dir=args.data_dir,
         device=args.device
     )

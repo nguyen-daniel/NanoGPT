@@ -169,6 +169,29 @@ The script will:
 - Compile the model with `torch.compile` on Linux for faster training
 - Save checkpoints to `out/ckpt.pt` when validation loss improves
 
+#### Resume Training
+
+If training is interrupted, you can resume from the last checkpoint:
+
+```bash
+python train.py --resume
+```
+
+This will load the model, optimizer, and scaler state from the checkpoint and continue training.
+
+#### TensorBoard Logging
+
+Enable TensorBoard to visualize training metrics:
+
+```bash
+python train.py --tensorboard
+```
+
+View the logs with:
+```bash
+tensorboard --logdir out/runs
+```
+
 ### 3. Generate Text
 
 Generate text from a trained model:
@@ -193,6 +216,26 @@ Arguments:
 - `--num_tokens`: Number of tokens to generate (default: 500)
 - `--temperature`: Sampling temperature - higher = more random (default: 1.0)
 - `--top_k`: Top-k sampling - only sample from top-k most likely tokens (default: None)
+- `--top_p`: Top-p (nucleus) sampling - keep tokens with cumulative probability >= p (default: None)
+
+#### Sampling Strategies
+
+**Temperature** controls randomness:
+- `temperature=0.8` — More focused, coherent text
+- `temperature=1.0` — Default, balanced
+- `temperature=1.2` — More creative, varied
+
+**Top-k** limits vocabulary to k most likely tokens:
+```bash
+python sample.py --top_k 40 --temperature 0.8
+```
+
+**Top-p (nucleus)** keeps tokens until cumulative probability reaches p:
+```bash
+python sample.py --top_p 0.9 --temperature 0.8
+```
+
+Top-p often produces better quality than top-k as it adapts to the confidence distribution.
 
 ## Architecture Overview
 
@@ -229,10 +272,9 @@ This is a small model suitable for educational purposes and can train on a singl
 
 - [ ] Add support for BPE (Byte Pair Encoding) tokenization
 - [ ] Implement gradient checkpointing for larger models
-- [ ] Add support for multi-GPU training
-- [ ] Implement more sophisticated sampling strategies (nucleus/top-p sampling)
-- [ ] Add training metrics visualization (TensorBoard integration)
-- [ ] Support for resuming training from checkpoints
+- [ ] Add support for multi-GPU training (DDP)
+- [ ] Add Flash Attention via PyTorch SDPA
+- [ ] Custom dataset support
 
 ## References
 

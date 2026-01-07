@@ -316,7 +316,7 @@ class GPT(nn.Module):
         return logits if loss is None else (logits, loss)
     
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Generate new tokens given a starting sequence.
         
@@ -325,6 +325,9 @@ class GPT(nn.Module):
             max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature (1.0 = no change, >1.0 = more random, <1.0 = more focused)
             top_k: If specified, only sample from top-k most likely tokens (None = no filtering)
+            top_p: If specified, use nucleus sampling - keep smallest set of tokens with cumulative
+                   probability >= top_p. Also known as nucleus sampling. (None = no filtering)
+                   Typical values: 0.9-0.95. Cannot be used with top_k.
         
         Returns:
             Generated token indices of shape (batch_size, seq_len + max_new_tokens)
@@ -346,6 +349,27 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
+            
+            # Apply top-p (nucleus) filtering if specified
+            # This keeps the smallest set of tokens with cumulative probability >= top_p
+            if top_p is not None:
+                # Sort logits in descending order
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                
+                # Compute cumulative probabilities
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Find tokens to remove (cumulative prob exceeds top_p)
+                # Shift right by 1 to keep at least one token
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                
+                # Scatter the removal mask back to original indices
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                )
+                logits[indices_to_remove] = float('-inf')
             
             # Apply softmax to get probabilities
             probs = torch.softmax(logits, dim=-1)

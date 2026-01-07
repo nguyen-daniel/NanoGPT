@@ -2,6 +2,7 @@
 Training script for NanoGPT.
 Implements the training loop with AdamW optimizer, batch sampling, and checkpointing.
 Includes cosine learning rate decay with warmup, torch.compile, and mixed-precision training.
+Supports resuming from checkpoints and optional TensorBoard logging.
 """
 
 import os
@@ -12,6 +13,13 @@ import torch.nn as nn
 from pathlib import Path
 from model import GPT, GPTConfig
 from data import prepare_data
+
+# Optional TensorBoard support (built into PyTorch, no extra install needed)
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 
 def get_device(device=None):
@@ -179,7 +187,9 @@ def train(
     device=None,  # None = auto-detect, or specify 'cuda', 'mps', 'cpu'
     out_dir='out',
     use_compile=True,
-    use_amp=True
+    use_amp=True,
+    resume=False,
+    use_tensorboard=False
 ):
     """
     Main training function.
@@ -201,6 +211,8 @@ def train(
         out_dir: Directory to save checkpoints
         use_compile: Whether to use torch.compile (only on Linux with CUDA)
         use_amp: Whether to use automatic mixed precision training (CUDA only)
+        resume: Whether to resume training from the latest checkpoint
+        use_tensorboard: Whether to log metrics to TensorBoard
     """
     # Determine device
     device_str, device_obj = get_device(device)
@@ -236,6 +248,17 @@ def train(
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
     
+    # Initialize TensorBoard writer if requested
+    writer = None
+    if use_tensorboard:
+        if TENSORBOARD_AVAILABLE:
+            log_dir = Path(out_dir) / 'runs'
+            writer = SummaryWriter(log_dir=log_dir)
+            print(f"TensorBoard logging enabled: {log_dir}")
+            print(f"  View with: tensorboard --logdir {log_dir}")
+        else:
+            print("Warning: TensorBoard requested but torch.utils.tensorboard not available")
+    
     # Initialize model
     print("\nInitializing model...")
     config = GPTConfig(
@@ -268,6 +291,45 @@ def train(
     # Mixed precision scaler (only needed for CUDA)
     scaler = torch.cuda.amp.GradScaler() if (use_amp and device_str == 'cuda') else None
     
+    # Resume from checkpoint if requested
+    start_iter = 0
+    best_val_loss = float('inf')
+    
+    if resume:
+        checkpoint_path = Path(out_dir) / 'ckpt.pt'
+        if checkpoint_path.exists():
+            print(f"\nResuming from checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
+            
+            # Load model state - handle torch.compile prefix if present
+            state_dict = checkpoint['model']
+            if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+                print("  Stripping '_orig_mod.' prefix from compiled checkpoint...")
+                state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+            
+            # Load into model (may need to unwrap if compiled)
+            if hasattr(model, '_orig_mod'):
+                model._orig_mod.load_state_dict(state_dict)
+            else:
+                model.load_state_dict(state_dict)
+            
+            # Load optimizer state
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            
+            # Load scaler state if available
+            if scaler is not None and checkpoint.get('scaler') is not None:
+                scaler.load_state_dict(checkpoint['scaler'])
+            
+            # Resume from next iteration
+            start_iter = checkpoint['iter_num'] + 1
+            best_val_loss = checkpoint['best_val_loss']
+            
+            print(f"  Resumed at iteration {start_iter}")
+            print(f"  Best validation loss so far: {best_val_loss:.4f}")
+        else:
+            print(f"\nWarning: --resume specified but no checkpoint found at {checkpoint_path}")
+            print("  Starting training from scratch...")
+    
     # Training loop
     print(f"\nStarting training on {device_str.upper()}...")
     if device_str == 'cuda':
@@ -278,10 +340,11 @@ def train(
     if use_amp and device_str == 'cuda':
         gpu_type = "AMD GPU (ROCm)" if is_amd_gpu else "NVIDIA GPU"
         print(f"Using mixed-precision training (FP16) on {gpu_type}")
+    if resume and start_iter > 0:
+        print(f"Resuming from iteration {start_iter}")
     print("-" * 60)
     
-    best_val_loss = float('inf')
-    iter_num = 0
+    iter_num = start_iter
     
     while iter_num < max_iters:
         # Update learning rate with warmup and cosine decay
@@ -316,6 +379,12 @@ def train(
             current_lr = optimizer.param_groups[0]['lr']
             print(f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
             
+            # Log to TensorBoard
+            if writer is not None:
+                writer.add_scalar('Loss/train', losses['train'], iter_num)
+                writer.add_scalar('Loss/val', losses['val'], iter_num)
+                writer.add_scalar('LearningRate', current_lr, iter_num)
+            
             # Save checkpoint if validation loss improved
             if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
@@ -333,10 +402,16 @@ def train(
         
         iter_num += 1
     
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
+    
     print("\n" + "=" * 60)
     print("Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Checkpoint saved to: {Path(out_dir) / 'ckpt.pt'}")
+    if writer is not None:
+        print(f"TensorBoard logs saved to: {Path(out_dir) / 'runs'}")
 
 
 if __name__ == '__main__':
@@ -375,6 +450,10 @@ if __name__ == '__main__':
                         help='Disable torch.compile (Linux CUDA only)')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed-precision training (CUDA only)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from the latest checkpoint')
+    parser.add_argument('--tensorboard', action='store_true',
+                        help='Enable TensorBoard logging (logs to out_dir/runs/)')
     
     args = parser.parse_args()
     
@@ -395,6 +474,8 @@ if __name__ == '__main__':
         device=args.device,  # Auto-detect if None
         out_dir=args.out_dir,
         use_compile=not args.no_compile,
-        use_amp=not args.no_amp
+        use_amp=not args.no_amp,
+        resume=args.resume,
+        use_tensorboard=args.tensorboard
     )
 
