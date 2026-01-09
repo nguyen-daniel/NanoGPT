@@ -1,10 +1,11 @@
 # NanoGPT
 
-A clean, educational implementation of GPT (Generative Pre-trained Transformer) from scratch in PyTorch, following Andrej Karpathy's architecture. This project implements a character-level language model trained on the Tiny Shakespeare dataset.
+A clean, educational implementation of GPT (Generative Pre-trained Transformer) from scratch in PyTorch, following Andrej Karpathy's architecture. This project implements a language model with support for both character-level and BPE (Byte Pair Encoding) tokenization, trained on the Tiny Shakespeare dataset or your own text corpus.
 
 ## Project Structure
 
-- **`data.py`** - Downloads and preprocesses the Tiny Shakespeare dataset, creates vocabulary and encoding/decoding functions
+- **`data.py`** - Downloads and preprocesses datasets, supports character-level and BPE tokenization
+- **`tokenizer.py`** - Tokenizer implementations (CharTokenizer and BPETokenizer)
 - **`model.py`** - Implements the GPT architecture with transformer blocks, attention, and MLP layers
 - **`train.py`** - Training script with AdamW optimizer, learning rate scheduling, mixed-precision training, and checkpointing
 - **`sample.py`** - Text generation script that loads a trained model and generates text from prompts
@@ -157,10 +158,31 @@ python data.py --input_file my_corpus.txt --data_dir my_data
 python train.py --data_dir my_data
 ```
 
-Options:
-- `--input_file`: Path to your text file
+#### BPE Tokenization
+
+By default, NanoGPT uses character-level tokenization. For better compression and handling of larger vocabularies, you can use BPE (Byte Pair Encoding):
+
+```bash
+# Train BPE tokenizer with 1000 vocabulary size
+python data.py --tokenizer bpe --vocab_size 1000
+
+# BPE with custom dataset
+python data.py --input_file my_corpus.txt --tokenizer bpe --vocab_size 2000
+```
+
+BPE benefits:
+- **Shorter sequences**: Typically 2-4x compression vs character-level
+- **Better rare word handling**: Subword tokens capture meaningful units
+- **Semantic boundaries**: Tokens often align with word parts
+
+The tokenizer type is automatically saved and detected during sampling.
+
+Data preparation options:
+- `--input_file`: Path to your text file (default: downloads Tiny Shakespeare)
 - `--data_dir`: Directory to save processed data (default: `data`)
 - `--train_split`: Fraction of data for training (default: `0.9`)
+- `--tokenizer`: Tokenizer type: `char` or `bpe` (default: `char`)
+- `--vocab_size`: Vocabulary size for BPE (default: `1000`, ignored for char)
 
 ### 2. Train the Model
 
@@ -172,15 +194,19 @@ python train.py
 
 The training script supports various hyperparameters. You can modify them in `train.py` or extend the script to accept command-line arguments:
 
-- `block_size`: Context length (default: 256)
-- `batch_size`: Batch size (default: 64)
-- `n_layer`: Number of transformer layers (default: 6)
-- `n_head`: Number of attention heads (default: 6)
-- `n_embd`: Embedding dimension (default: 384)
-- `learning_rate`: Maximum learning rate (default: 3e-4)
-- `max_iters`: Maximum training iterations (default: 5000)
-- `warmup_iters`: Warmup iterations (default: 100)
-- `min_lr`: Minimum learning rate as fraction of max_lr (default: 0.1)
+- `--block_size`: Context length (default: 256)
+- `--batch_size`: Batch size (default: 64)
+- `--n_layer`: Number of transformer layers (default: 6)
+- `--n_head`: Number of attention heads (default: 6)
+- `--n_embd`: Embedding dimension (default: 384)
+- `--learning_rate`: Maximum learning rate (default: 3e-4)
+- `--max_iters`: Maximum training iterations (default: 5000)
+- `--warmup_iters`: Warmup iterations (default: 100)
+- `--min_lr`: Minimum learning rate as fraction of max_lr (default: 0.1)
+- `--gradient_checkpointing`: Enable gradient checkpointing for memory savings
+- `--no_flash_attn`: Disable Flash Attention
+- `--tensorboard`: Enable TensorBoard logging
+- `--resume`: Resume training from checkpoint
 
 The script will:
 - Use cosine learning rate decay with linear warmup
@@ -196,6 +222,16 @@ Flash Attention is enabled by default on PyTorch 2.0+ for significant memory sav
 ```bash
 python train.py --no_flash_attn
 ```
+
+#### Gradient Checkpointing
+
+For training larger models on limited GPU memory, enable gradient checkpointing. This trades ~20-30% speed for ~50% memory reduction:
+
+```bash
+python train.py --gradient_checkpointing
+```
+
+This works by recomputing activations during the backward pass instead of storing them, allowing you to train deeper models or use larger batch sizes.
 
 #### Resume Training
 
@@ -283,6 +319,8 @@ The model follows the standard GPT architecture:
 - **Clean, Modular Code**: Each component is well-separated and educational
 - **Efficient Training**: Mixed-precision training and torch.compile support for faster training
 - **Flash Attention**: Memory-efficient attention via PyTorch SDPA (2-4x memory reduction)
+- **Gradient Checkpointing**: Trade compute for memory to train larger models
+- **BPE Tokenization**: Subword tokenization for better compression and vocabulary handling
 - **Custom Datasets**: Train on any text file, not just Shakespeare
 - **Learning Rate Scheduling**: Cosine decay with linear warmup for stable training
 - **Checkpointing**: Saves best model based on validation loss; supports resuming training
@@ -301,8 +339,6 @@ This is a small model suitable for educational purposes and can train on a singl
 
 ## Future Improvements
 
-- [ ] Add support for BPE (Byte Pair Encoding) tokenization
-- [ ] Implement gradient checkpointing for larger models
 - [ ] Add support for multi-GPU training (DDP)
 
 ## References

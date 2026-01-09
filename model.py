@@ -8,6 +8,7 @@ Implements a decoder-only transformer following the GPT architecture.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from dataclasses import dataclass
 
 # Check if Flash Attention is available via PyTorch's scaled_dot_product_attention
@@ -26,6 +27,7 @@ class GPTConfig:
         n_head: Number of attention heads in multi-head attention
         n_embd: Embedding dimension (size of token embeddings)
         use_flash_attn: Whether to use Flash Attention (PyTorch SDPA)
+        gradient_checkpointing: Whether to use gradient checkpointing to save memory
     """
     block_size: int = 1024  # context length
     vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
@@ -33,6 +35,7 @@ class GPTConfig:
     n_head: int = 12  # number of attention heads
     n_embd: int = 768  # embedding dimension
     use_flash_attn: bool = True  # use Flash Attention via PyTorch SDPA when available
+    gradient_checkpointing: bool = False  # trade compute for memory during training
 
 
 class CausalSelfAttention(nn.Module):
@@ -316,8 +319,21 @@ class GPT(nn.Module):
         x = self.dropout(x)
         
         # Pass through transformer blocks
-        for block in self.blocks:
-            x = block(x)
+        # Gradient checkpointing trades compute for memory by recomputing
+        # activations during the backward pass instead of storing them
+        if self.config.gradient_checkpointing and self.training:
+            for block in self.blocks:
+                # use_reentrant=False is recommended for new code (PyTorch 2.0+)
+                # preserve_rng_state=True ensures dropout is consistent
+                x = gradient_checkpoint(
+                    block,
+                    x,
+                    use_reentrant=False,
+                    preserve_rng_state=True
+                )
+        else:
+            for block in self.blocks:
+                x = block(x)
         
         # Apply final layer normalization
         x = self.ln_f(x)

@@ -190,7 +190,8 @@ def train(
     use_amp=True,
     resume=False,
     use_tensorboard=False,
-    use_flash_attn=True
+    use_flash_attn=True,
+    gradient_checkpointing=False
 ):
     """
     Main training function.
@@ -215,6 +216,7 @@ def train(
         resume: Whether to resume training from the latest checkpoint
         use_tensorboard: Whether to log metrics to TensorBoard
         use_flash_attn: Whether to use Flash Attention (PyTorch SDPA) for memory efficiency
+        gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
     """
     # Determine device
     device_str, device_obj = get_device(device)
@@ -269,7 +271,8 @@ def train(
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
-        use_flash_attn=use_flash_attn
+        use_flash_attn=use_flash_attn,
+        gradient_checkpointing=gradient_checkpointing
     )
     model = GPT(config)
     model = model.to(device_obj)
@@ -286,6 +289,10 @@ def train(
         print("Flash Attention requested but not available (requires PyTorch 2.0+)")
     else:
         print("Flash Attention disabled (using manual attention)")
+    
+    # Report gradient checkpointing status
+    if gradient_checkpointing:
+        print("Gradient checkpointing enabled (trading compute for ~50% memory reduction)")
     
     # Apply torch.compile if on Linux and requested
     if use_compile and platform.system() == 'Linux' and device_str == 'cuda':
@@ -468,6 +475,8 @@ if __name__ == '__main__':
                         help='Resume training from the latest checkpoint')
     parser.add_argument('--tensorboard', action='store_true',
                         help='Enable TensorBoard logging (logs to out_dir/runs/)')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)')
     
     args = parser.parse_args()
     
@@ -491,6 +500,7 @@ if __name__ == '__main__':
         use_amp=not args.no_amp,
         resume=args.resume,
         use_tensorboard=args.tensorboard,
-        use_flash_attn=not args.no_flash_attn
+        use_flash_attn=not args.no_flash_attn,
+        gradient_checkpointing=args.gradient_checkpointing
     )
 

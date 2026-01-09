@@ -1,12 +1,14 @@
 """
 Text generation script for NanoGPT.
 Loads a trained checkpoint and generates text from a prompt.
+Automatically detects tokenizer type (character or BPE) from the data directory.
 """
 
 import torch
 import argparse
 from pathlib import Path
 from model import GPT, GPTConfig
+from tokenizer import load_tokenizer
 
 
 def get_device(device=None):
@@ -111,13 +113,15 @@ def load_checkpoint(checkpoint_path, device):
 
 def load_vocabulary(data_dir='data'):
     """
-    Load vocabulary and encoding/decoding functions from data.py.
+    Load tokenizer from data directory.
+    
+    Automatically detects tokenizer type (character or BPE) from saved metadata.
     
     Args:
-        data_dir: Directory containing vocabulary metadata
+        data_dir: Directory containing vocabulary/tokenizer data
     
     Returns:
-        Dictionary with 'encode' and 'decode' functions
+        Dictionary with 'encode', 'decode' functions and 'vocab_size'
     """
     data_path = Path(data_dir)
     vocab_path = data_path / 'vocab.pt'
@@ -125,26 +129,19 @@ def load_vocabulary(data_dir='data'):
     if not vocab_path.exists():
         raise FileNotFoundError(f"Vocabulary file not found at {vocab_path}. Run data.py first.")
     
-    print(f"Loading vocabulary from {vocab_path}...")
-    # weights_only=False is safe here since we trust our own vocabulary files
-    vocab_metadata = torch.load(vocab_path, weights_only=False)
+    print(f"Loading tokenizer from {vocab_path}...")
     
-    # Create encode and decode functions
-    char_to_int = vocab_metadata['char_to_int']
-    int_to_char = vocab_metadata['int_to_char']
+    # Load tokenizer using the unified loader (auto-detects type)
+    tokenizer = load_tokenizer(vocab_path)
     
-    def encode(text):
-        """Convert string to list of integers."""
-        return [char_to_int[ch] for ch in text]
+    print(f"Tokenizer loaded: {tokenizer.type}, vocab_size={tokenizer.vocab_size}")
     
-    def decode(integers):
-        """Convert list of integers to string."""
-        return ''.join([int_to_char[i] for i in integers])
-    
-    vocab_size = vocab_metadata['vocab_size']
-    print(f"Vocabulary loaded: {vocab_size} unique characters")
-    
-    return {'encode': encode, 'decode': decode, 'vocab_size': vocab_size}
+    return {
+        'encode': tokenizer.encode,
+        'decode': tokenizer.decode,
+        'vocab_size': tokenizer.vocab_size,
+        'tokenizer': tokenizer
+    }
 
 
 def generate_text(
