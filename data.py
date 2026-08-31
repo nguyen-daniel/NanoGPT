@@ -176,11 +176,26 @@ def prepare_data(data_dir='data', train_split=0.9, input_file=None,
     data = torch.tensor(tokens, dtype=torch.long)
     print(f"Encoded dataset: {len(data):,} tokens")
     
-    # Calculate compression ratio for BPE
+    # Calculate compression ratio for BPE and persist it
     if tokenizer_type == 'bpe':
+        import json
         char_count = len(text)
         compression = char_count / len(data)
         print(f"Compression ratio: {compression:.2f}x (vs character-level)")
+        results_dir = Path('results')
+        results_dir.mkdir(exist_ok=True)
+        payload = {
+            "corpus_characters": char_count,
+            "bpe_tokens": int(len(data)),
+            "vocab_size": tokenizer.vocab_size,
+            "compression_ratio_vs_char": compression,
+            "resume_claim": "2–4x sequence compression vs char",
+            "claim_met": 2.0 <= compression <= 4.5,
+        }
+        (results_dir / "bpe_compression.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+        print(f"Wrote {results_dir / 'bpe_compression.json'}")
     
     # Split into train and validation
     n = len(data)
