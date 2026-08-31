@@ -22,11 +22,14 @@ jobs:
         
     - name: Install dependencies
       run: |
-        pip install torch numpy tiktoken requests
+        pip install -r requirements.txt
         
+    - name: Unit tests (tokenizer + attention)
+      run: python -m unittest discover -s tests -v
+
     - name: Run smoke test (5 iterations)
       run: |
-        python -c "from train import train; train(max_iters=5, eval_interval=5, use_compile=False, use_amp=False, device='cpu')"
+        python -c "from train import train; train(max_iters=5, eval_interval=5, eval_iters=1, use_compile=False, use_amp=False, device='cpu')"
 
 
 

@@ -13,6 +13,7 @@ import torch.nn as nn
 from pathlib import Path
 from model import GPT, GPTConfig
 from data import prepare_data
+from device import detect_device, report_device, set_seed, supports_amp, supports_compile
 
 # Optional TensorBoard support (built into PyTorch, no extra install needed)
 try:
@@ -24,85 +25,48 @@ except ImportError:
 
 def get_device(device=None):
     """
-    Get the best available device for training.
-    
-    Supports:
-    - CUDA (NVIDIA GPUs)
-    - ROCm (AMD GPUs) - accessed via 'cuda' device string
-    - MPS (Apple Silicon GPUs)
-    - CPU (fallback)
-    
-    Args:
-        device: Optional device string ('cuda', 'mps', 'cpu', or None for auto-detect)
-    
+    Resolve the training device (CUDA, ROCm, DirectML, MPS, or CPU).
+
     Returns:
-        Device string and device object
+        (backend_name, torch.device) for callers that still unpack a pair.
+        Use detect_device() when you need the full DeviceInfo.
     """
-    if device is None:
-        # Auto-detect best available device
-        if torch.cuda.is_available():
-            device = 'cuda'
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-            
-            # Detect if it's an AMD GPU (ROCm) or NVIDIA GPU
-            # ROCm devices typically show up with AMD in the name or via backend
-            is_amd = 'AMD' in gpu_name.upper() or 'Radeon' in gpu_name or 'ROCm' in str(torch.version.hip) if hasattr(torch.version, 'hip') else False
-            
-            if is_amd:
-                print(f"ROCm available: Using AMD GPU ({gpu_name})")
-                print(f"GPU Memory: {gpu_memory:.2f} GB")
-            else:
-                print(f"CUDA available: Using NVIDIA GPU ({gpu_name})")
-                print(f"GPU Memory: {gpu_memory:.2f} GB")
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            device = 'mps'
-            print("MPS available: Using Apple Silicon GPU")
-        else:
-            device = 'cpu'
-            print("Using CPU (no GPU available)")
-    else:
-        # Validate requested device
-        if device == 'cuda' and not torch.cuda.is_available():
-            print("Warning: CUDA/ROCm requested but not available. Falling back to CPU.")
-            print("Note: For AMD GPUs, install PyTorch with ROCm support:")
-            print("  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7")
-            device = 'cpu'
-        elif device == 'mps' and (not hasattr(torch.backends, 'mps') or not torch.backends.mps.is_available()):
-            print("Warning: MPS requested but not available. Falling back to CPU.")
-            device = 'cpu'
-        elif device not in ['cuda', 'mps', 'cpu']:
-            print(f"Warning: Unknown device '{device}'. Using CPU.")
-            device = 'cpu'
-    
-    return device, torch.device(device)
+    info = detect_device(device)
+    report_device(info)
+    return info.backend, info.device
+
+
+def get_batch_loop(data, block_size, batch_size, device):
+    """
+    Historical batch path: Python loop + per-batch .to(device).
+
+    Kept so benches/bench_dataloader.py can measure the new gather path
+    against the implementation the resume previously implied.
+    """
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i : i + block_size] for i in ix])
+    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+    return x.to(device), y.to(device)
 
 
 def get_batch(data, block_size, batch_size, device):
     """
-    Sample a random batch of data for training.
-    
-    Args:
-        data: Tensor of shape (N,) containing token indices
-        block_size: Context length (sequence length)
-        batch_size: Number of sequences in the batch
-        device: Device to place tensors on
-    
-    Returns:
-        x: Input sequences of shape (batch_size, block_size)
-        y: Target sequences of shape (batch_size, block_size)
+    Vectorized batch gather.
+
+    If `data` already lives on `device`, the gather stays on that device
+    (the AMD/Windows path: keep Tiny Shakespeare tokens on DirectML).
+    Otherwise gather on the data's device and copy once with non_blocking
+    when the destination is CUDA.
     """
-    # Sample random starting indices for each sequence in the batch
-    # We need to ensure we don't go out of bounds, so max index is len(data) - block_size
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    
-    # Extract sequences of length block_size starting from each random index
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    # Targets are the same sequences shifted by 1 position
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    
-    # Move to device
-    x, y = x.to(device), y.to(device)
+    n = data.size(0) - block_size
+    ix = torch.randint(n, (batch_size,), device=data.device)
+    offsets = torch.arange(block_size, device=data.device)
+    x = data[ix.unsqueeze(1) + offsets]
+    y = data[ix.unsqueeze(1) + offsets + 1]
+    if x.device != device:
+        non_blocking = getattr(device, "type", None) == "cuda"
+        x = x.to(device, non_blocking=non_blocking)
+        y = y.to(device, non_blocking=non_blocking)
     return x, y
 
 
@@ -184,7 +148,8 @@ def train(
     min_lr=0.1,
     eval_interval=500,
     eval_iters=200,
-    device=None,  # None = auto-detect, or specify 'cuda', 'mps', 'cpu'
+    device=None,  # None = auto-detect, or 'cuda' / 'directml' / 'mps' / 'cpu'
+    seed=1337,
     out_dir='out',
     use_compile=True,
     use_amp=True,
@@ -209,7 +174,8 @@ def train(
         min_lr: Minimum learning rate (as fraction of max_lr)
         eval_interval: Evaluate and print loss every N iterations
         eval_iters: Number of iterations to average loss over during evaluation
-        device: Device to train on (None = auto-detect, 'cuda', 'mps', or 'cpu')
+        device: Device to train on (None = auto-detect, 'cuda', 'directml', 'mps', or 'cpu')
+        seed: RNG seed for reproducible runs
         out_dir: Directory to save checkpoints
         use_compile: Whether to use torch.compile (only on Linux with CUDA)
         use_amp: Whether to use automatic mixed precision training (CUDA only)
@@ -218,14 +184,14 @@ def train(
         use_flash_attn: Whether to use Flash Attention (PyTorch SDPA) for memory efficiency
         gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
     """
-    # Determine device
-    device_str, device_obj = get_device(device)
-    
-    # Check if AMD GPU for later use
-    is_amd_gpu = False
-    if device_str == 'cuda' and torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        is_amd_gpu = 'AMD' in gpu_name.upper() or 'Radeon' in gpu_name or (hasattr(torch.version, 'hip') and 'ROCm' in str(torch.version.hip))
+    set_seed(seed)
+    info = detect_device(device)
+    report_device(info)
+    device_str = info.backend
+    device_obj = info.device
+    amp_ok = use_amp and supports_amp(info)
+    compile_ok = use_compile and supports_compile(info)
+    is_amd_gpu = info.backend in ("rocm", "directml") or "radeon" in info.name.lower() or "amd" in info.name.lower()
     
     # Load data
     print("Loading data...")
@@ -245,6 +211,16 @@ def train(
         vocab_metadata = torch.load(data_path / 'vocab.pt')
         vocab_size = vocab_metadata['vocab_size']
     
+    # Keep tokens on the training device so get_batch() is a GPU gather,
+    # not a Python loop + H2D copy. Tiny Shakespeare fits in a few MB.
+    try:
+        train_data = train_data.to(device_obj)
+        val_data = val_data.to(device_obj)
+        print(f"Token tensors on {train_data.device} (device-resident gather)")
+    except Exception as exc:
+        print(f"Warning: could not move token tensors to {device_obj}: {exc}")
+        print("  Falling back to host-side gather + copy.")
+
     print(f"Training data: {len(train_data):,} tokens")
     print(f"Validation data: {len(val_data):,} tokens")
     print(f"Vocabulary size: {vocab_size}")
@@ -294,21 +270,19 @@ def train(
     if gradient_checkpointing:
         print("Gradient checkpointing enabled (trading compute for ~50% memory reduction)")
     
-    # Apply torch.compile if on Linux and requested
-    if use_compile and platform.system() == 'Linux' and device_str == 'cuda':
+    # Apply torch.compile only on Linux CUDA/ROCm
+    if compile_ok:
         print("Compiling model with torch.compile...")
         model = torch.compile(model)
         print("Model compiled successfully")
-    elif use_compile and platform.system() != 'Linux':
-        print("Warning: torch.compile is only supported on Linux. Skipping compilation.")
-    elif use_compile and device_str != 'cuda':
-        print("Warning: torch.compile is most effective on CUDA. Skipping compilation.")
+    elif use_compile:
+        print(f"Warning: torch.compile skipped on {platform.system()} / {device_str}.")
     
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
-    # Mixed precision scaler (only needed for CUDA)
-    scaler = torch.cuda.amp.GradScaler() if (use_amp and device_str == 'cuda') else None
+    # Mixed precision: CUDA/ROCm only. DirectML is FP32.
+    scaler = torch.cuda.amp.GradScaler() if amp_ok else None
     
     # Resume from checkpoint if requested
     start_iter = 0
@@ -318,7 +292,7 @@ def train(
         checkpoint_path = Path(out_dir) / 'ckpt.pt'
         if checkpoint_path.exists():
             print(f"\nResuming from checkpoint: {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device_obj, weights_only=False)
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             
             # Load model state - handle torch.compile prefix if present
             state_dict = checkpoint['model']
@@ -350,15 +324,15 @@ def train(
             print("  Starting training from scratch...")
     
     # Training loop
-    print(f"\nStarting training on {device_str.upper()}...")
-    if device_str == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"\nStarting training on {device_str} ({info.name})...")
     print(f"Max iterations: {max_iters}")
     print(f"Warmup iterations: {warmup_iters}")
     print(f"Evaluation interval: {eval_interval} iterations")
-    if use_amp and device_str == 'cuda':
+    if amp_ok:
         gpu_type = "AMD GPU (ROCm)" if is_amd_gpu else "NVIDIA GPU"
         print(f"Using mixed-precision training (FP16) on {gpu_type}")
+    elif use_amp and not amp_ok:
+        print("Mixed precision disabled (not supported on this backend; using FP32)")
     if resume and start_iter > 0:
         print(f"Resuming from iteration {start_iter}")
     print("-" * 60)
@@ -373,9 +347,14 @@ def train(
         
         # Sample a batch of data
         x, y = get_batch(train_data, block_size, batch_size, device_obj)
-        
+        if iter_num == start_iter:
+            param_dev = next(model.parameters()).device
+            print(f"Proof: batch x.device={x.device}  model.param.device={param_dev}")
+            if x.device != param_dev:
+                print("Warning: batch and model are on different devices")
+
         # Forward and backward pass with mixed precision if enabled
-        if use_amp and device_str == 'cuda' and scaler is not None:
+        if amp_ok and scaler is not None:
             # Mixed precision forward pass
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits, loss = model(x, y)
@@ -394,7 +373,7 @@ def train(
         
         # Evaluate periodically
         if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, use_amp and device_str == 'cuda')
+            losses = estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, amp_ok)
             current_lr = optimizer.param_groups[0]['lr']
             print(f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
             
@@ -438,7 +417,9 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='Train NanoGPT model')
     parser.add_argument('--device', type=str, default=None,
-                        help='Device to use (cuda/mps/cpu, default: auto-detect)')
+                        help='Device to use (cuda/directml/mps/cpu, default: auto-detect)')
+    parser.add_argument('--seed', type=int, default=1337,
+                        help='RNG seed (default: 1337)')
     parser.add_argument('--data_dir', type=str, default='data',
                         help='Directory containing processed data (default: data)')
     parser.add_argument('--block_size', type=int, default=256,
@@ -495,6 +476,7 @@ if __name__ == '__main__':
         eval_interval=args.eval_interval,
         eval_iters=args.eval_iters,
         device=args.device,  # Auto-detect if None
+        seed=args.seed,
         out_dir=args.out_dir,
         use_compile=not args.no_compile,
         use_amp=not args.no_amp,

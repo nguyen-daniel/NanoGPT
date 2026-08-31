@@ -1,0 +1,10 @@
+# Native Windows + AMD (Radeon RX 7800 XT / DirectX 12).
+# Python 3.11 only. Do not pre-install a newer torch — this package
+# pulls the compatible torch 2.4.x build.
+#
+#   conda create -n nanogpt-dml python=3.11 -y
+#   conda activate nanogpt-dml
+#   pip install -r requirements-directml.txt
+#
+torch-directml
+requests>=2.28
