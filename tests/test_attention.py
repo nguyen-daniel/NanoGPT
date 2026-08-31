@@ -9,8 +9,8 @@ from model import CausalSelfAttention, GPT, GPTConfig
 
 class TestAttention(unittest.TestCase):
     def test_sdpa_and_manual_shapes_match(self):
-        cfg_sdpa = GPTConfig(block_size=32, n_head=4, n_embd=64, use_flash_attn=True)
-        cfg_man = GPTConfig(block_size=32, n_head=4, n_embd=64, use_flash_attn=False)
+        cfg_sdpa = GPTConfig(block_size=32, n_head=4, n_embd=64, use_sdpa=True)
+        cfg_man = GPTConfig(block_size=32, n_head=4, n_embd=64, use_sdpa=False)
         sdpa = CausalSelfAttention(cfg_sdpa).eval()
         manual = CausalSelfAttention(cfg_man).eval()
         # Shared projection weights so the comparison is fair
@@ -31,7 +31,7 @@ class TestAttention(unittest.TestCase):
             n_layer=2,
             n_head=4,
             n_embd=64,
-            use_flash_attn=True,
+            use_sdpa=True,
         )
         model = GPT(cfg)
         idx = torch.randint(0, 50, (2, 8))

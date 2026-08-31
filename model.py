@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from dataclasses import dataclass
 
-# Check if Flash Attention is available via PyTorch's scaled_dot_product_attention
-FLASH_ATTN_AVAILABLE = hasattr(F, 'scaled_dot_product_attention')
+# PyTorch 2.0+ SDPA; the backend may dispatch FlashAttention when it provides one.
+SDPA_AVAILABLE = hasattr(F, 'scaled_dot_product_attention')
 
 
 @dataclass
@@ -26,7 +26,7 @@ class GPTConfig:
         n_layer: Number of transformer decoder layers
         n_head: Number of attention heads in multi-head attention
         n_embd: Embedding dimension (size of token embeddings)
-        use_flash_attn: Whether to use Flash Attention (PyTorch SDPA)
+        use_sdpa: Whether to use PyTorch SDPA (F.scaled_dot_product_attention)
         gradient_checkpointing: Whether to use gradient checkpointing to save memory
     """
     block_size: int = 1024  # context length
@@ -34,7 +34,7 @@ class GPTConfig:
     n_layer: int = 12  # number of transformer blocks
     n_head: int = 12  # number of attention heads
     n_embd: int = 768  # embedding dimension
-    use_flash_attn: bool = True  # use Flash Attention via PyTorch SDPA when available
+    use_sdpa: bool = True  # F.scaled_dot_product_attention when available (backend may use FlashAttention)
     gradient_checkpointing: bool = False  # trade compute for memory during training
 
 
@@ -45,8 +45,9 @@ class CausalSelfAttention(nn.Module):
     Implements scaled dot-product attention with a causal mask to prevent
     the model from looking at future tokens during autoregressive generation.
     
-    When Flash Attention is enabled and available (PyTorch 2.0+), uses
-    F.scaled_dot_product_attention for better memory efficiency and speed.
+    When use_sdpa is set and SDPA is available (PyTorch 2.0+), uses
+    F.scaled_dot_product_attention. The backend may dispatch FlashAttention
+    when it provides that kernel; this is not a custom FlashAttention impl.
     """
     
     def __init__(self, config: GPTConfig):
@@ -65,8 +66,7 @@ class CausalSelfAttention(nn.Module):
         self.head_size = config.n_embd // config.n_head
         self.dropout = 0.1
         
-        # Determine if we should use Flash Attention
-        self.use_flash_attn = config.use_flash_attn and FLASH_ATTN_AVAILABLE
+        self.use_sdpa = config.use_sdpa and SDPA_AVAILABLE
         
         # Key, Query, Value projections for all heads
         # We use a single linear layer and split it into heads
@@ -80,8 +80,8 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(self.dropout)
         
         # Causal mask: prevents attention to future positions
-        # Only needed for manual attention (Flash Attention has built-in causal masking)
-        if not self.use_flash_attn:
+        # Only needed for manual attention (SDPA uses is_causal=True)
+        if not self.use_sdpa:
             self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
                                           .view(1, 1, config.block_size, config.block_size))
     
@@ -117,9 +117,8 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         v = v.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         
-        if self.use_flash_attn:
-            # Flash Attention via PyTorch's scaled_dot_product_attention
-            # This is significantly more memory efficient and faster for long sequences
+        if self.use_sdpa:
+            # PyTorch SDPA; backend may dispatch FlashAttention when available
             # is_causal=True handles the causal masking internally
             y = F.scaled_dot_product_attention(
                 q, k, v,

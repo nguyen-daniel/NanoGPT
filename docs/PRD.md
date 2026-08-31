@@ -190,7 +190,7 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 | FR-17 | TensorBoard integration | ✅ Complete |
 | FR-18 | Resume training from checkpoint | ✅ Complete |
 | FR-19 | Custom dataset support | ✅ Complete |
-| FR-20 | Flash Attention (PyTorch SDPA) + memory bench | ✅ Complete |
+| FR-20 | PyTorch SDPA (F.scaled_dot_product_attention) + memory bench | ✅ Complete |
 | FR-21 | DirectML (Windows AMD) device path | ✅ Complete |
 | FR-22 | Vectorized / device-resident get_batch + bench | ✅ Complete |
 
