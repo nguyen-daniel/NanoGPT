@@ -1,0 +1,41 @@
+{
+  "sample_train": {
+    "device": "cpu",
+    "reason": "DirectML 6x6x384 runs on the RX 7800 XT and the live DML val loss falls, but CPU re-eval of cloned weights stops improving around val 3.1\u20133.3 (unigram/bigram stage) then gets worse. The committed sample is from a CPU-trained 6x6x192 model whose val loss is measured on CPU.",
+    "seed": 1337,
+    "max_iters": 5000,
+    "iter_num": 4750,
+    "best_val_loss": 1.7092256546020508,
+    "cpu_train_loss": 1.5292956829071045,
+    "cpu_val_loss": 1.698675513267517,
+    "n_layer": 6,
+    "n_head": 6,
+    "n_embd": 192,
+    "block_size": 128,
+    "batch_size": 64,
+    "elapsed_sec": 2810.2
+  },
+  "directml_7800xt": {
+    "backend": "directml",
+    "device_name": "AMD Radeon RX 7800 XT",
+    "torch_device": "privateuseone:1",
+    "proof": "batch x.device=privateuseone:1  model.param.device=privateuseone:1",
+    "seed": 1337,
+    "max_iters": 5000,
+    "n_layer": 6,
+    "n_head": 6,
+    "n_embd": 384,
+    "block_size": 256,
+    "batch_size": 64,
+    "directml_reported_best_val_loss": 1.4659,
+    "cpu_reeval_of_that_ckpt_val_loss": 5.8566,
+    "cpu_gated_best_val_loss": 3.17,
+    "cpu_gated_iter": 250,
+    "note": "Native Windows + torch-directml, FP32. AdamW foreach=False, grad_clip=1.0, CPU-cloned checkpoints. DML eval is not used as the save metric."
+  },
+  "sample_path": "results/sample_shakespeare.txt",
+  "prompt": "ROMEO:",
+  "temperature": 0.8,
+  "top_k": 40,
+  "checkpoint": "out_cpu/ckpt.pt (gitignored; not committed)"
+}

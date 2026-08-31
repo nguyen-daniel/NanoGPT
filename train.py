@@ -156,7 +156,8 @@ def train(
     resume=False,
     use_tensorboard=False,
     use_sdpa=True,
-    gradient_checkpointing=False
+    gradient_checkpointing=False,
+    grad_clip=1.0,
 ):
     """
     Main training function.
@@ -183,6 +184,7 @@ def train(
         use_tensorboard: Whether to log metrics to TensorBoard
         use_sdpa: Whether to use PyTorch SDPA (F.scaled_dot_product_attention)
         gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
+        grad_clip: Max gradient norm (0 disables clipping). Needed for stable DirectML runs.
     """
     set_seed(seed)
     info = detect_device(device)
@@ -277,8 +279,14 @@ def train(
     elif use_compile:
         print(f"Warning: torch.compile skipped on {platform.system()} / {device_str}.")
     
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # Initialize optimizer.
+    # DirectML's foreach AdamW uses aten::lerp which falls back to CPU and can
+    # desynchronize GPU weights over long runs; disable foreach on that backend.
+    adamw_kwargs = dict(lr=learning_rate)
+    if info.backend == "directml":
+        adamw_kwargs["foreach"] = False
+        print("AdamW foreach=False (DirectML lerp fallback is unsafe for long runs)")
+    optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
     
     # Mixed precision: CUDA/ROCm only. DirectML is FP32.
     scaler = torch.cuda.amp.GradScaler() if amp_ok else None
@@ -286,6 +294,11 @@ def train(
     # Resume from checkpoint if requested
     start_iter = 0
     best_val_loss = float('inf')
+    best_cpu_val_loss = float('inf')
+
+    # Host copies for DirectML CPU re-eval (DML reported loss can diverge from saved weights)
+    cpu_train_data = train_data.cpu() if getattr(train_data.device, "type", None) != "cpu" else train_data
+    cpu_val_data = val_data.cpu() if getattr(val_data.device, "type", None) != "cpu" else val_data
     
     if resume:
         checkpoint_path = Path(out_dir) / 'ckpt.pt'
@@ -315,6 +328,8 @@ def train(
             # Resume from next iteration
             start_iter = checkpoint['iter_num'] + 1
             best_val_loss = checkpoint['best_val_loss']
+            if checkpoint.get('cpu_val_loss') is not None:
+                best_cpu_val_loss = checkpoint['cpu_val_loss']
             
             print(f"  Resumed at iteration {start_iter}")
             print(f"  Best validation loss so far: {best_val_loss:.4f}")
@@ -361,6 +376,9 @@ def train(
             # Mixed precision backward pass
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+            if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -368,6 +386,8 @@ def train(
             logits, loss = model(x, y)
             optimizer.zero_grad()
             loss.backward()
+            if grad_clip and grad_clip > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         
         # Evaluate periodically
@@ -383,19 +403,53 @@ def train(
                 writer.add_scalar('LearningRate', current_lr, iter_num)
             
             # Save checkpoint if validation loss improved
-            if losses['val'] < best_val_loss:
+            cpu_val = None
+            state_dict = {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()}
+            if info.backend == "directml":
+                cpu_model = GPT(config)
+                cpu_model.load_state_dict(state_dict)
+                cpu_losses = estimate_loss(
+                    cpu_model,
+                    cpu_train_data,
+                    cpu_val_data,
+                    block_size,
+                    min(batch_size, 16),
+                    min(eval_iters, 8),
+                    torch.device("cpu"),
+                    False,
+                )
+                cpu_val = cpu_losses["val"]
+                print(
+                    f"  CPU re-eval train {cpu_losses['train']:.4f} | val {cpu_val:.4f}"
+                )
+                del cpu_model
+                # Trust the CPU number for checkpointing; DirectML eval can be optimistic.
+                save_val = cpu_val
+
+            improved = (
+                cpu_val < best_cpu_val_loss
+                if cpu_val is not None
+                else losses["val"] < best_val_loss
+            )
+            if improved:
                 best_val_loss = losses['val']
+                if cpu_val is not None:
+                    best_cpu_val_loss = cpu_val
                 checkpoint = {
-                    'model': model.state_dict(),
+                    'model': state_dict,
                     'optimizer': optimizer.state_dict(),
                     'config': config,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
+                    'cpu_val_loss': cpu_val,
                     'scaler': scaler.state_dict() if scaler is not None else None,
                 }
                 checkpoint_path = Path(out_dir) / 'ckpt.pt'
                 torch.save(checkpoint, checkpoint_path)
-                print(f"  -> Checkpoint saved (val loss: {best_val_loss:.4f})")
+                extra = f", cpu val {cpu_val:.4f}" if cpu_val is not None else ""
+                print(f"  -> Checkpoint saved (val loss: {best_val_loss:.4f}{extra})")
+            elif info.backend == "directml" and cpu_val is not None:
+                print("  -> Skip save (CPU val did not improve; DirectML val not used)")
         
         iter_num += 1
     
@@ -457,6 +511,8 @@ if __name__ == '__main__':
                         help='Enable TensorBoard logging (logs to out_dir/runs/)')
     parser.add_argument('--gradient_checkpointing', action='store_true',
                         help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='Max gradient norm (default: 1.0; 0 disables)')
     
     args = parser.parse_args()
     
@@ -482,6 +538,7 @@ if __name__ == '__main__':
         resume=args.resume,
         use_tensorboard=args.tensorboard,
         use_sdpa=not args.no_sdpa,
-        gradient_checkpointing=args.gradient_checkpointing
+        gradient_checkpointing=args.gradient_checkpointing,
+        grad_clip=args.grad_clip,
     )
 
