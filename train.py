@@ -155,7 +155,7 @@ def train(
     use_amp=True,
     resume=False,
     use_tensorboard=False,
-    use_flash_attn=True,
+    use_sdpa=True,
     gradient_checkpointing=False
 ):
     """
@@ -181,7 +181,7 @@ def train(
         use_amp: Whether to use automatic mixed precision training (CUDA only)
         resume: Whether to resume training from the latest checkpoint
         use_tensorboard: Whether to log metrics to TensorBoard
-        use_flash_attn: Whether to use Flash Attention (PyTorch SDPA) for memory efficiency
+        use_sdpa: Whether to use PyTorch SDPA (F.scaled_dot_product_attention)
         gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
     """
     set_seed(seed)
@@ -247,7 +247,7 @@ def train(
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
-        use_flash_attn=use_flash_attn,
+        use_sdpa=use_sdpa,
         gradient_checkpointing=gradient_checkpointing
     )
     model = GPT(config)
@@ -257,14 +257,13 @@ def train(
     n_params = model.get_num_params() / 1e6
     print(f"Model initialized with {n_params:.2f}M parameters")
     
-    # Report Flash Attention status
-    from model import FLASH_ATTN_AVAILABLE
-    if use_flash_attn and FLASH_ATTN_AVAILABLE:
-        print("Flash Attention enabled (PyTorch SDPA)")
-    elif use_flash_attn and not FLASH_ATTN_AVAILABLE:
-        print("Flash Attention requested but not available (requires PyTorch 2.0+)")
+    from model import SDPA_AVAILABLE
+    if use_sdpa and SDPA_AVAILABLE:
+        print("SDPA enabled (F.scaled_dot_product_attention; backend may dispatch FlashAttention)")
+    elif use_sdpa and not SDPA_AVAILABLE:
+        print("SDPA requested but not available (requires PyTorch 2.0+); using manual attention")
     else:
-        print("Flash Attention disabled (using manual attention)")
+        print("SDPA disabled (using manual attention)")
     
     # Report gradient checkpointing status
     if gradient_checkpointing:
@@ -450,8 +449,8 @@ if __name__ == '__main__':
                         help='Disable torch.compile (Linux CUDA only)')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed-precision training (CUDA only)')
-    parser.add_argument('--no_flash_attn', action='store_true',
-                        help='Disable Flash Attention (PyTorch SDPA)')
+    parser.add_argument('--no_sdpa', action='store_true',
+                        help='Disable PyTorch SDPA (use manual QK^T + causal mask)')
     parser.add_argument('--resume', action='store_true',
                         help='Resume training from the latest checkpoint')
     parser.add_argument('--tensorboard', action='store_true',
@@ -482,7 +481,7 @@ if __name__ == '__main__':
         use_amp=not args.no_amp,
         resume=args.resume,
         use_tensorboard=args.tensorboard,
-        use_flash_attn=not args.no_flash_attn,
+        use_sdpa=not args.no_sdpa,
         gradient_checkpointing=args.gradient_checkpointing
     )
 

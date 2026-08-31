@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from device import detect_device, report_device  # noqa: E402
-from model import FLASH_ATTN_AVAILABLE, GPTConfig, CausalSelfAttention  # noqa: E402
+from model import SDPA_AVAILABLE, GPTConfig, CausalSelfAttention  # noqa: E402
 
 
 def _sync(device):
@@ -105,13 +105,13 @@ def main():
         block_size=args.block_size,
         n_head=args.n_head,
         n_embd=args.n_embd,
-        use_flash_attn=True,
+        use_sdpa=True,
     )
     cfg_manual = GPTConfig(
         block_size=args.block_size,
         n_head=args.n_head,
         n_embd=args.n_embd,
-        use_flash_attn=False,
+        use_sdpa=False,
     )
 
     x = torch.randn(args.batch_size, args.block_size, args.n_embd, requires_grad=True)
@@ -134,7 +134,7 @@ def main():
             "backend": info.backend,
             "device_name": info.name,
             "torch_device": str(info.device),
-            "flash_attn_available": FLASH_ATTN_AVAILABLE,
+            "sdpa_available": SDPA_AVAILABLE,
             "sdpa_impl": str(getattr(F, "scaled_dot_product_attention", None)),
         },
         "config": {
@@ -150,7 +150,7 @@ def main():
         "resume_claim": "2–4x memory reduction vs vanilla PyTorch attention",
         "claim_met": bool(ratio is not None and 2.0 <= ratio <= 8.0),
         "note": (
-            "SDPA is F.scaled_dot_product_attention (not the flash-attn package). "
+            "SDPA is F.scaled_dot_product_attention; the backend may dispatch FlashAttention. "
             "On CUDA, peak allocated bytes are measured. On DirectML/CPU, CUDA peak "
             "is unavailable — compare theoretical attn-matrix size and wall time. "
             "DirectML may execute SDPA as math attention, so the memory ratio can be ~1x."
