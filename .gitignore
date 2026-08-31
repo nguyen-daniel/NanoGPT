@@ -42,6 +42,7 @@ venv.bak/
 
 # Model outputs and checkpoints
 out/
+out_*/
 checkpoints/
 models/
 runs/

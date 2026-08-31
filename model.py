@@ -85,15 +85,17 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
                                           .view(1, 1, config.block_size, config.block_size))
     
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
         """
         Forward pass of causal self-attention.
-        
+
         Args:
             x: Input tensor of shape (batch_size, seq_len, n_embd)
-        
+            past_kv: Optional (past_k, past_v), each (batch, n_head, T_past, head_size)
+            use_cache: If True, also return present (k, v) for the next decode step
+
         Returns:
-            Output tensor of shape (batch_size, seq_len, n_embd)
+            y of shape (batch_size, seq_len, n_embd), or (y, present_kv) if use_cache
         """
         batch_size, seq_len, n_embd = x.shape
         
@@ -116,26 +118,64 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         k = k.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
         v = v.transpose(1, 2)  # (batch_size, n_head, seq_len, head_size)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=2)
+            v = torch.cat((past_v, v), dim=2)
+
+        t_q = q.size(2)
+        t_k = k.size(2)
         
         if self.use_sdpa:
-            # PyTorch SDPA; backend may dispatch FlashAttention when available
-            # is_causal=True handles the causal masking internally
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True
-            )
+            # PyTorch SDPA; backend may dispatch FlashAttention when available.
+            # First step (no cache): full prompt, is_causal=True.
+            # Later steps: one new token over cached K/V + new; is_causal=False.
+            if past_kv is None:
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,
+                )
+            elif t_q == 1:
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
+            else:
+                # Prefix cache + several new tokens: attend to all past, causal among new.
+                # Additive -inf mask (not a bool mask) so the meaning is unambiguous.
+                past_len = t_k - t_q
+                q_pos = torch.arange(t_q, device=q.device)
+                k_pos = torch.arange(t_k, device=q.device)
+                disallowed = k_pos.unsqueeze(0) > (past_len + q_pos).unsqueeze(1)
+                attn_mask = torch.zeros(t_q, t_k, device=q.device, dtype=q.dtype)
+                attn_mask = attn_mask.masked_fill(disallowed, float("-inf"))
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
+                )
         else:
             # Manual attention computation (fallback for older PyTorch versions)
             # Scaled dot-product attention
             # Compute attention scores: Q @ K^T / sqrt(head_size)
-            # Shape: (batch_size, n_head, seq_len, seq_len)
+            # Shape: (batch_size, n_head, t_q, t_k)
             att = (q @ k.transpose(-2, -1)) * (1.0 / (self.head_size ** 0.5))
-            
-            # Apply causal mask: set future positions to -inf
-            # The mask has 1s for positions we can attend to, 0s for positions we cannot
-            att = att.masked_fill(self.bias[:, :, :seq_len, :seq_len] == 0, float('-inf'))
+
+            if past_kv is None:
+                att = att.masked_fill(self.bias[:, :, :t_q, :t_k] == 0, float("-inf"))
+            elif t_q > 1:
+                past_len = t_k - t_q
+                q_pos = torch.arange(t_q, device=att.device)
+                k_pos = torch.arange(t_k, device=att.device)
+                allowed = k_pos.unsqueeze(0) <= (past_len + q_pos).unsqueeze(1)
+                att = att.masked_fill(~allowed, float("-inf"))
+            # t_q == 1 and past exists: attend to all cached K/V + new token (no mask)
             
             # Softmax to get attention weights
             att = torch.softmax(att, dim=-1)
@@ -154,7 +194,9 @@ class CausalSelfAttention(nn.Module):
         # Output projection
         y = self.c_proj(y)
         y = self.resid_dropout(y)
-        
+
+        if use_cache:
+            return y, (k, v)
         return y
 
 
@@ -221,16 +263,25 @@ class Block(nn.Module):
         # Feedforward MLP
         self.mlp = MLP(config)
     
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
         """
         Forward pass of the transformer block.
         
         Args:
             x: Input tensor of shape (batch_size, seq_len, n_embd)
+            past_kv: Optional cached (k, v) for this layer's attention
+            use_cache: If True, also return this layer's present (k, v)
         
         Returns:
-            Output tensor of shape (batch_size, seq_len, n_embd)
+            Output tensor of shape (batch_size, seq_len, n_embd),
+            or (output, present_kv) if use_cache
         """
+        if use_cache:
+            attn_out, present_kv = self.attn(self.ln_1(x), past_kv=past_kv, use_cache=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln_2(x))
+            return x, present_kv
+
         # Self-attention with residual connection
         x = x + self.attn(self.ln_1(x))
         
@@ -283,7 +334,7 @@ class GPT(nn.Module):
         # This is a common technique that reduces parameters and can improve performance
         self.token_embedding.weight = self.lm_head.weight
         
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kvs=None, use_cache=False):
         """
         Forward pass of the GPT model.
         
@@ -291,20 +342,31 @@ class GPT(nn.Module):
             idx: Input token indices of shape (batch_size, seq_len)
             targets: Target token indices for training, shape (batch_size, seq_len)
                     If None, model is in inference mode.
+            past_kvs: Optional list of per-layer (k, v) caches from a previous step
+            use_cache: If True, also return present K/V for each layer
         
         Returns:
             If targets is None: logits of shape (batch_size, seq_len, vocab_size)
             If targets is provided: (logits, loss) tuple
+            If use_cache: appends a list of present (k, v) per layer
         """
         batch_size, seq_len = idx.shape
+
+        past_len = 0
+        if past_kvs is not None:
+            past_len = past_kvs[0][0].size(2)
+        if past_len + seq_len > self.config.block_size:
+            raise ValueError(
+                f"past_len ({past_len}) + seq_len ({seq_len}) exceeds "
+                f"block_size ({self.config.block_size})"
+            )
         
         # Get token embeddings
         # Shape: (batch_size, seq_len, n_embd)
         token_embeddings = self.token_embedding(idx)
         
-        # Create position indices [0, 1, 2, ..., seq_len-1]
-        # Shape: (seq_len,)
-        position_indices = torch.arange(seq_len, device=idx.device)
+        # Positions continue after the cached prefix (0..T-1 on the first step)
+        position_indices = torch.arange(past_len, past_len + seq_len, device=idx.device)
         
         # Get position embeddings
         # Shape: (seq_len, n_embd) -> broadcasted to (batch_size, seq_len, n_embd)
@@ -320,7 +382,8 @@ class GPT(nn.Module):
         # Pass through transformer blocks
         # Gradient checkpointing trades compute for memory by recomputing
         # activations during the backward pass instead of storing them
-        if self.config.gradient_checkpointing and self.training:
+        presents = [] if use_cache else None
+        if self.config.gradient_checkpointing and self.training and not use_cache:
             for block in self.blocks:
                 # use_reentrant=False is recommended for new code (PyTorch 2.0+)
                 # preserve_rng_state=True ensures dropout is consistent
@@ -331,8 +394,13 @@ class GPT(nn.Module):
                     preserve_rng_state=True
                 )
         else:
-            for block in self.blocks:
-                x = block(x)
+            for i, block in enumerate(self.blocks):
+                past = past_kvs[i] if past_kvs is not None else None
+                if use_cache:
+                    x, present = block(x, past_kv=past, use_cache=True)
+                    presents.append(present)
+                else:
+                    x = block(x)
         
         # Apply final layer normalization
         x = self.ln_f(x)
@@ -353,13 +421,18 @@ class GPT(nn.Module):
             
             # Calculate cross-entropy loss
             loss = nn.functional.cross_entropy(logits_flat, targets_flat)
-        
+
+        if use_cache:
+            return (logits, presents) if loss is None else (logits, loss, presents)
         return logits if loss is None else (logits, loss)
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Generate new tokens given a starting sequence.
+
+        First step forwards the full (cropped) prompt and stores K/V.
+        Later steps forward one new token and attend over the cached K/V.
         
         Args:
             idx: Starting token indices of shape (batch_size, seq_len)
@@ -374,53 +447,52 @@ class GPT(nn.Module):
             Generated token indices of shape (batch_size, seq_len + max_new_tokens)
         """
         self.eval()
-        
-        for _ in range(max_new_tokens):
-            # Crop context to block_size if needed
-            idx_cond = idx[:, -self.config.block_size:]
-            
-            # Forward pass to get logits
-            logits = self(idx_cond, targets=None)
-            
+
+        def _sample_next(step_logits):
             # Focus only on the last time step
             # Shape: (batch_size, vocab_size)
-            logits = logits[:, -1, :] / temperature
-            
+            step_logits = step_logits[:, -1, :] / temperature
+
             # Apply top-k filtering if specified
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
-            
+                v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
+                step_logits[step_logits < v[:, [-1]]] = float("-inf")
+
             # Apply top-p (nucleus) filtering if specified
             # This keeps the smallest set of tokens with cumulative probability >= top_p
             if top_p is not None:
-                # Sort logits in descending order
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                
-                # Compute cumulative probabilities
+                sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
                 cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                
-                # Find tokens to remove (cumulative prob exceeds top_p)
-                # Shift right by 1 to keep at least one token
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
-                
-                # Scatter the removal mask back to original indices
                 indices_to_remove = sorted_indices_to_remove.scatter(
                     dim=-1, index=sorted_indices, src=sorted_indices_to_remove
                 )
-                logits[indices_to_remove] = float('-inf')
-            
-            # Apply softmax to get probabilities
-            probs = torch.softmax(logits, dim=-1)
-            
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Append sampled index to the running sequence
+                step_logits[indices_to_remove] = float("-inf")
+
+            probs = torch.softmax(step_logits, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+
+        # First step: full prompt (cropped), populate the KV cache
+        idx_cond = idx[:, -self.config.block_size:]
+        logits, past_kvs = self(idx_cond, targets=None, use_cache=True)
+
+        for _ in range(max_new_tokens):
+            idx_next = _sample_next(logits)
             idx = torch.cat((idx, idx_next), dim=1)
-        
+
+            cache_len = past_kvs[0][0].size(2)
+            if cache_len >= self.config.block_size:
+                # Sliding window: recompute last block_size tokens (positions 0..T-1)
+                idx_cond = idx[:, -self.config.block_size:]
+                logits, past_kvs = self(idx_cond, targets=None, use_cache=True)
+            else:
+                # One new token; attend over cached K/V + this token (is_causal=False)
+                logits, past_kvs = self(
+                    idx_next, targets=None, past_kvs=past_kvs, use_cache=True
+                )
+
         self.train()
         return idx
     
