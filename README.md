@@ -1,6 +1,7 @@
 # NanoGPT
 
 [![CI](https://github.com/nguyen-daniel/NanoGPT/actions/workflows/main.yml/badge.svg)](https://github.com/nguyen-daniel/NanoGPT/actions/workflows/main.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Decoder-only GPT in PyTorch (Karpathy-style): train on Tiny Shakespeare or your own text, sample from a checkpoint. Character tokenizer by default; optional BPE.
 
