@@ -1,352 +1,65 @@
 # NanoGPT
 
-A clean, educational implementation of GPT (Generative Pre-trained Transformer) from scratch in PyTorch, following Andrej Karpathy's architecture. This project implements a language model with support for both character-level and BPE (Byte Pair Encoding) tokenization, trained on the Tiny Shakespeare dataset or your own text corpus.
+Decoder-only GPT in PyTorch (Karpathy-style): train on Tiny Shakespeare or your own text, sample from a checkpoint. Character tokenizer by default; optional BPE.
 
-## Project Structure
+## Results
 
-- **`data.py`** - Downloads and preprocesses datasets, supports character-level and BPE tokenization
-- **`tokenizer.py`** - Tokenizer implementations (CharTokenizer and BPETokenizer)
-- **`model.py`** - Implements the GPT architecture with transformer blocks, attention, and MLP layers
-- **`train.py`** - Training script with AdamW optimizer, learning rate scheduling, mixed-precision training, and checkpointing
-- **`sample.py`** - Text generation script that loads a trained model and generates text from prompts
+Measured on **AMD Radeon RX 7800 XT** (Windows, **DirectML** — not CUDA). Reproduce: `python device.py`, then `python train.py --max_iters 5 --no_amp --no_compile`.
 
-## Installation
+| Topic | What is true | Artifact |
+|-------|----------------|----------|
+| GPU | Training tensors live on `privateuseone:1` / RX 7800 XT | `scripts/check_gpu.py`, train log `Proof: batch x.device=...` |
+| Attention | Causal self-attention via **`F.scaled_dot_product_attention`** (PyTorch SDPA; uses a FlashAttention kernel **when the backend provides one**). Manual attention is the fallback (`--no_flash_attn`). This is not a from-scratch FlashAttention implementation. | `model.py`, `tests/test_attention.py` |
+| Size | Default 6×6×384 is ~10–15M parameters (vocab-dependent); printed at train start | train log |
+| BPE | Sequence length vs char is measured, not assumed | `python benches/bench_bpe.py` → `results/bpe_compression.json` |
+| Batching | Vectorized gather; optional device-resident tokens | `get_batch()` vs `get_batch_loop()` in `train.py` |
+
+No 2–4× memory or 40% data-loading claims. If you run `make bench`, treat the JSON as the only numbers.
+
+### Sample output
+
+After a 3-step smoke train (GPU-proven, **not** a trained language model):
+
+```
+ROMEO:ent AR#go.
+
+KING theirJ … Why, ut … ishayTIO:
+```
+
+After a full `python train.py` (5000 iters, default size) you should see Shakespeare-like fragments. Quality tracks iteration count, not the smoke checkpoint.
+
+## Install
 
 ```bash
-# Clone the repository
-git clone <your-repo-url>
+git clone https://github.com/nguyen-daniel/NanoGPT.git
 cd NanoGPT
 
-# Create and activate a virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# CPU / CI
+pip install -r requirements.txt
 
-# Install dependencies
-pip install torch requests
-
-# For AMD GPU support (ROCm), see "AMD GPU Setup" section below
+# Windows + AMD (RX 7800 XT): Python 3.11, do not pre-install a newer torch
+# conda create -n nanogpt-dml python=3.11 -y && conda activate nanogpt-dml
+pip install -r requirements-directml.txt
+python device.py
+# expect: Device backend: directml / Device name: AMD Radeon RX 7800 XT
 ```
-
-### GPU Support
-
-The code automatically detects and uses available GPUs:
-
-- **NVIDIA GPUs**: Uses CUDA (default PyTorch installation)
-- **AMD GPUs**: Uses ROCm (requires PyTorch with ROCm support) - see "AMD GPU Setup" below
-- **Apple Silicon**: Uses MPS (Metal Performance Shaders)
-- **CPU**: Automatic fallback if no GPU is available
-
-The training script will automatically detect and use your GPU if available. You can also force a specific device:
-```bash
-python train.py --device cuda    # Use GPU (NVIDIA or AMD with ROCm)
-python train.py --device cpu     # Force CPU
-```
-
-### AMD GPU Setup
-
-For AMD GPUs, you need to install PyTorch with ROCm support. Follow these steps:
-
-#### 1. Check Your ROCm Version (if already installed)
-
-If you have ROCm installed, check the version:
-
-```bash
-# Method 1: Using rocm-smi
-rocm-smi --version
-
-# Method 2: Check ROCm installation directory
-cat /opt/rocm/.info/version-* 2>/dev/null
-
-# Method 3: Check package manager (Debian/Ubuntu)
-dpkg -l | grep rocm
-
-# Method 4: Check package manager (Arch Linux)
-pacman -Q | grep rocm
-```
-
-#### 2. Install PyTorch with ROCm Support
-
-**Option A: If you have ROCm installed**, install PyTorch matching your ROCm version:
-
-```bash
-# For ROCm 5.6
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm5.6
-
-# For ROCm 5.7
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm5.7
-
-# For ROCm 6.0
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
-```
-
-**Note:** `torchaudio` may not be available for all ROCm versions. You can install just `torch` and `torchvision` if needed.
-
-**Option B: If you don't have ROCm installed**, you can install PyTorch with ROCm support directly (PyTorch will work with compatible ROCm versions):
-
-```bash
-# Try the latest ROCm version (usually 5.7 or 6.0)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm5.7
-```
-
-Check the [PyTorch ROCm installation guide](https://pytorch.org/get-started/locally/) for the latest supported versions.
-
-#### 3. Verify AMD GPU Detection
-
-After installation, verify PyTorch can see your AMD GPU:
-
-```bash
-python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
-```
-
-You should see output like:
-```
-CUDA available: True
-GPU: AMD Radeon RX 7900 XTX
-```
-
-#### 4. Run Training
-
-The training script will automatically detect and use your AMD GPU:
-
-```bash
-python train.py
-```
-
-You should see output like:
-```
-ROCm available: Using AMD GPU (AMD Radeon RX 7900 XTX)
-GPU Memory: 24.00 GB
-Starting training on CUDA...
-```
-
-**Note:** AMD GPUs are accessed via the same `cuda` device string in PyTorch (ROCm is CUDA-compatible), so the code will show "CUDA" but it's actually using ROCm.
-
-#### Troubleshooting
-
-- **"CUDA not available"**: Make sure PyTorch with ROCm is installed correctly
-- **"torchaudio not found"**: This is normal for some ROCm versions. Install only `torch` and `torchvision`
-- **Performance issues**: Ensure ROCm drivers are properly installed and your GPU is supported
-- **Check GPU compatibility**: See [ROCm documentation](https://rocm.docs.amd.com/) for supported GPUs
-
-## Usage
-
-### 1. Prepare the Dataset
-
-#### Default: Tiny Shakespeare
-
-Download and preprocess the Tiny Shakespeare dataset:
 
 ```bash
 python data.py
+python train.py --max_iters 50 --eval_interval 50 --eval_iters 2 --no_amp --no_compile
+python sample.py --prompt "ROMEO:"
+python -m unittest discover -s tests -v
+make bench    # optional measurements, not resume copy
 ```
 
-This will:
-- Download the dataset to `data/input.txt`
-- Create vocabulary from unique characters
-- Generate `data/train.pt`, `data/val.pt`, and `data/vocab.pt`
-- Split data into 90% training and 10% validation sets
+## Architecture
 
-#### Custom Dataset
+Token + position embeddings → decoder blocks (pre-norm, causal attention, GELU MLP) → LM head with weight tying. SDPA when `use_flash_attn` is on; otherwise explicit `QK^T` + causal mask.
 
-Train on your own text file:
+## AMD Radeon RX 7800 XT
 
-```bash
-# Prepare your custom dataset
-python data.py --input_file my_corpus.txt --data_dir my_data
+ROCm is not available on native Windows. Use **torch-directml** (DirectX 12). AMP and `torch.compile` are skipped on DirectML (FP32).
 
-# Train on the custom data
-python train.py --data_dir my_data
-```
+Look for: `Device backend: directml`, `Device name: AMD Radeon RX 7800 XT`, `Proof: batch x.device=privateuseone:1` matching a model parameter — not `cpu`. Saved: `results/gpu_proof.json`.
 
-#### BPE Tokenization
-
-By default, NanoGPT uses character-level tokenization. For better compression and handling of larger vocabularies, you can use BPE (Byte Pair Encoding):
-
-```bash
-# Train BPE tokenizer with 1000 vocabulary size
-python data.py --tokenizer bpe --vocab_size 1000
-
-# BPE with custom dataset
-python data.py --input_file my_corpus.txt --tokenizer bpe --vocab_size 2000
-```
-
-BPE benefits:
-- **Shorter sequences**: Typically 2-4x compression vs character-level
-- **Better rare word handling**: Subword tokens capture meaningful units
-- **Semantic boundaries**: Tokens often align with word parts
-
-The tokenizer type is automatically saved and detected during sampling.
-
-Data preparation options:
-- `--input_file`: Path to your text file (default: downloads Tiny Shakespeare)
-- `--data_dir`: Directory to save processed data (default: `data`)
-- `--train_split`: Fraction of data for training (default: `0.9`)
-- `--tokenizer`: Tokenizer type: `char` or `bpe` (default: `char`)
-- `--vocab_size`: Vocabulary size for BPE (default: `1000`, ignored for char)
-
-### 2. Train the Model
-
-Train the GPT model:
-
-```bash
-python train.py
-```
-
-The training script supports various hyperparameters. You can modify them in `train.py` or extend the script to accept command-line arguments:
-
-- `--block_size`: Context length (default: 256)
-- `--batch_size`: Batch size (default: 64)
-- `--n_layer`: Number of transformer layers (default: 6)
-- `--n_head`: Number of attention heads (default: 6)
-- `--n_embd`: Embedding dimension (default: 384)
-- `--learning_rate`: Maximum learning rate (default: 3e-4)
-- `--max_iters`: Maximum training iterations (default: 5000)
-- `--warmup_iters`: Warmup iterations (default: 100)
-- `--min_lr`: Minimum learning rate as fraction of max_lr (default: 0.1)
-- `--gradient_checkpointing`: Enable gradient checkpointing for memory savings
-- `--no_flash_attn`: Disable Flash Attention
-- `--tensorboard`: Enable TensorBoard logging
-- `--resume`: Resume training from checkpoint
-
-The script will:
-- Use cosine learning rate decay with linear warmup
-- Apply mixed-precision training (FP16) on CUDA if available
-- Use Flash Attention (PyTorch SDPA) for memory-efficient attention
-- Compile the model with `torch.compile` on Linux for faster training
-- Save checkpoints to `out/ckpt.pt` when validation loss improves
-
-#### Flash Attention
-
-Flash Attention is enabled by default on PyTorch 2.0+ for significant memory savings and faster training on long sequences. To disable:
-
-```bash
-python train.py --no_flash_attn
-```
-
-#### Gradient Checkpointing
-
-For training larger models on limited GPU memory, enable gradient checkpointing. This trades ~20-30% speed for ~50% memory reduction:
-
-```bash
-python train.py --gradient_checkpointing
-```
-
-This works by recomputing activations during the backward pass instead of storing them, allowing you to train deeper models or use larger batch sizes.
-
-#### Resume Training
-
-If training is interrupted, you can resume from the last checkpoint:
-
-```bash
-python train.py --resume
-```
-
-This will load the model, optimizer, and scaler state from the checkpoint and continue training.
-
-#### TensorBoard Logging
-
-Enable TensorBoard to visualize training metrics:
-
-```bash
-python train.py --tensorboard
-```
-
-View the logs with:
-```bash
-tensorboard --logdir out/runs
-```
-
-### 3. Generate Text
-
-Generate text from a trained model:
-
-```bash
-python sample.py
-```
-
-Options:
-```bash
-python sample.py \
-    --checkpoint out/ckpt.pt \
-    --prompt "\n" \
-    --num_tokens 500 \
-    --temperature 1.0 \
-    --top_k 40
-```
-
-Arguments:
-- `--checkpoint`: Path to model checkpoint (default: `out/ckpt.pt`)
-- `--prompt`: Starting text prompt (default: `\n`)
-- `--num_tokens`: Number of tokens to generate (default: 500)
-- `--temperature`: Sampling temperature - higher = more random (default: 1.0)
-- `--top_k`: Top-k sampling - only sample from top-k most likely tokens (default: None)
-- `--top_p`: Top-p (nucleus) sampling - keep tokens with cumulative probability >= p (default: None)
-
-#### Sampling Strategies
-
-**Temperature** controls randomness:
-- `temperature=0.8` — More focused, coherent text
-- `temperature=1.0` — Default, balanced
-- `temperature=1.2` — More creative, varied
-
-**Top-k** limits vocabulary to k most likely tokens:
-```bash
-python sample.py --top_k 40 --temperature 0.8
-```
-
-**Top-p (nucleus)** keeps tokens until cumulative probability reaches p:
-```bash
-python sample.py --top_p 0.9 --temperature 0.8
-```
-
-Top-p often produces better quality than top-k as it adapts to the confidence distribution.
-
-## Architecture Overview
-
-The model follows the standard GPT architecture:
-
-1. **Token and Position Embeddings**: Convert token indices to dense vectors and add positional information
-2. **Transformer Blocks**: Stack of decoder blocks, each containing:
-   - **Causal Self-Attention**: Multi-head attention with causal masking to prevent looking at future tokens
-   - **MLP**: Two-layer feedforward network with GELU activation
-   - **Residual Connections**: Around both attention and MLP layers
-   - **Layer Normalization**: Applied before attention and MLP (pre-norm architecture)
-3. **Language Modeling Head**: Projects hidden states to vocabulary logits
-4. **Weight Tying**: Shares weights between token embedding and output projection
-
-## Key Features
-
-- **Clean, Modular Code**: Each component is well-separated and educational
-- **Efficient Training**: Mixed-precision training and torch.compile support for faster training
-- **Flash Attention**: Memory-efficient attention via PyTorch SDPA (2-4x memory reduction)
-- **Gradient Checkpointing**: Trade compute for memory to train larger models
-- **BPE Tokenization**: Subword tokenization for better compression and vocabulary handling
-- **Custom Datasets**: Train on any text file, not just Shakespeare
-- **Learning Rate Scheduling**: Cosine decay with linear warmup for stable training
-- **Checkpointing**: Saves best model based on validation loss; supports resuming training
-- **TensorBoard Integration**: Visualize training metrics in real-time
-- **Text Generation**: Autoregressive generation with temperature, top-k, and top-p sampling
-
-## Model Size
-
-The default configuration creates a model with approximately:
-- **6 transformer layers**
-- **6 attention heads per layer**
-- **384 embedding dimensions**
-- **~10-15M parameters** (depending on vocabulary size)
-
-This is a small model suitable for educational purposes and can train on a single GPU in reasonable time.
-
-## Future Improvements
-
-- [ ] Add support for multi-GPU training (DDP)
-
-## References
-
-- [Attention Is All You Need](https://arxiv.org/abs/1706.03762) - Original transformer paper
-- [Language Models are Unsupervised Multitask Learners](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) - GPT-2 paper
-- [Andrej Karpathy's NanoGPT](https://github.com/karpathy/nanoGPT) - Inspiration for this implementation
-
-## License
-
-This project is for educational purposes.
+A 3-iteration smoke train is enough to prove the device; generated text will be noise until you run a full `python train.py`. Sampling loads the checkpoint on CPU then moves the model to DirectML (`sample.py`).

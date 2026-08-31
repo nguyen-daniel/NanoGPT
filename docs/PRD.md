@@ -166,7 +166,7 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 | FR-03 | Train model with loss tracking | ✅ Complete |
 | FR-04 | Save/load model checkpoints | ✅ Complete |
 | FR-05 | Generate text from trained model | ✅ Complete |
-| FR-06 | Support CUDA/ROCm/MPS/CPU devices | ✅ Complete |
+| FR-06 | Support CUDA/ROCm/DirectML/MPS/CPU devices | ✅ Complete |
 
 ### 5.2 Should Have (P1)
 
@@ -183,14 +183,16 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 
 | ID | Requirement | Status |
 |----|-------------|--------|
-| FR-13 | BPE tokenization (byte-pair encoding) | 🔲 Planned |
-| FR-14 | Gradient checkpointing for larger models | 🔲 Planned |
+| FR-13 | BPE tokenization (byte-pair encoding) | ✅ Complete |
+| FR-14 | Gradient checkpointing for larger models | ✅ Complete |
 | FR-15 | Multi-GPU training (DDP) | 🔲 Planned |
-| FR-16 | Top-p (nucleus) sampling | 🔲 Planned |
-| FR-17 | TensorBoard integration | 🔲 Planned |
-| FR-18 | Resume training from checkpoint | 🔲 Planned |
-| FR-19 | Custom dataset support | 🔲 Planned |
-| FR-20 | Flash Attention integration | 🔲 Planned |
+| FR-16 | Top-p (nucleus) sampling | ✅ Complete |
+| FR-17 | TensorBoard integration | ✅ Complete |
+| FR-18 | Resume training from checkpoint | ✅ Complete |
+| FR-19 | Custom dataset support | ✅ Complete |
+| FR-20 | Flash Attention (PyTorch SDPA) + memory bench | ✅ Complete |
+| FR-21 | DirectML (Windows AMD) device path | ✅ Complete |
+| FR-22 | Vectorized / device-resident get_batch + bench | ✅ Complete |
 
 ---
 
@@ -212,6 +214,7 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 | Linux (AMD ROCm) | Full (compile + AMP) |
 | macOS (Apple Silicon MPS) | Partial (no compile/AMP) |
 | Windows (NVIDIA CUDA) | Partial (no compile) |
+| Windows (AMD DirectML) | Partial (FP32, no compile/AMP) |
 | CPU (any OS) | Baseline (slower) |
 
 ### 6.3 Code Quality
@@ -229,11 +232,11 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 
 ```bash
 # Clone and setup
-git clone <repo-url>
+git clone https://github.com/nguyen-daniel/NanoGPT.git
 cd NanoGPT
 python -m venv venv
 source venv/bin/activate
-pip install torch requests
+pip install -r requirements.txt
 
 # Prepare data
 python data.py

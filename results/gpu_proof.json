@@ -1,0 +1,8 @@
+{
+  "backend": "directml",
+  "device_name": "AMD Radeon RX 7800 XT",
+  "torch_device": "privateuseone:1",
+  "proof": "batch x.device=privateuseone:1  model.param.device=privateuseone:1",
+  "run": "python train.py --max_iters 3 --eval_interval 3 --eval_iters 1 --no_amp --no_compile --batch_size 8 --block_size 64 --n_layer 4 --n_head 4 --n_embd 128",
+  "note": "Native Windows + torch-directml. CUDA is not used (AMD GPU). Index 1 is the discrete 7800 XT; index 0 is the iGPU."
+}
