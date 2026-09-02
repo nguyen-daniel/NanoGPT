@@ -68,19 +68,22 @@ class CharTokenizer(BaseTokenizer):
     Character-level tokenizer.
 
     Maps each unique character in the corpus to an integer ID.
-    Simple and works well for small vocabularies and educational purposes.
+    Unknown characters encode to UNK (NUL, ``\\0``) instead of raising KeyError.
     """
+
+    UNK = "\0"
 
     def __init__(self, vocab: list[str]):
         """
         Initialize character tokenizer with vocabulary.
 
         Args:
-            vocab: List of unique characters (sorted)
+            vocab: List of unique characters (typically sorted, plus UNK)
         """
-        self._vocab = vocab
-        self._char_to_int = {ch: i for i, ch in enumerate(vocab)}
-        self._int_to_char = {i: ch for i, ch in enumerate(vocab)}
+        self._vocab = list(vocab)
+        self._char_to_int = {ch: i for i, ch in enumerate(self._vocab)}
+        self._int_to_char = {i: ch for i, ch in enumerate(self._vocab)}
+        self._unk_id = self._char_to_int.get(self.UNK, 0)
 
     @property
     def type(self) -> str:
@@ -96,8 +99,8 @@ class CharTokenizer(BaseTokenizer):
         return self._vocab
 
     def encode(self, text: str) -> list[int]:
-        """Convert text to list of character IDs."""
-        return [self._char_to_int[ch] for ch in text]
+        """Convert text to character IDs; unknown characters map to UNK (or id 0)."""
+        return [self._char_to_int.get(ch, self._unk_id) for ch in text]
 
     def decode(self, tokens: list[int]) -> str:
         """Convert list of character IDs to text."""
@@ -136,7 +139,7 @@ class CharTokenizer(BaseTokenizer):
         Returns:
             Trained CharTokenizer
         """
-        vocab = sorted(list(set(text)))
+        vocab = sorted(set(text) | {cls.UNK})
         return cls(vocab=vocab)
 
 

@@ -1,5 +1,6 @@
-# CPU / CI baseline. Do not pin torch-directml here — it pulls
-# PyTorch 2.4.x and requires Python 3.11, which would break CPU CI
-# on newer Python (3.12/3.13) and on Linux runners without DirectML.
-torch>=2.0
-requests>=2.28
+# CPU / CI baseline. Tested with torch 2.13.0+cpu and requests 2.32.5.
+# Do not pin torch-directml here — it pulls PyTorch 2.4.x and requires
+# Python 3.11, which would break CPU CI on newer Python (3.12/3.13)
+# and on Linux runners without DirectML. See requirements-directml.txt.
+torch>=2.0,<3
+requests>=2.28,<3

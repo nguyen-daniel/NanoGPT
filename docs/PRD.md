@@ -96,7 +96,7 @@ To provide the clearest possible implementation of a GPT-style transformer, enab
 |-----------|----------------|
 | `download_shakespeare()` | Fetch Tiny Shakespeare dataset from GitHub |
 | `load_custom_file()` | Validate a user-supplied corpus path |
-| `CharTokenizer` / `BPETokenizer` | Tokenize (`tokenizer.py`); char by default, optional BPE |
+| `CharTokenizer` / `BPETokenizer` | Tokenize (`tokenizer.py`); char by default (unknown chars → UNK), optional BPE |
 | `prepare_data()` | Orchestrate full pipeline, save train/val splits and `vocab.pt` |
 
 `get_vocabulary()` and `create_encoder_decoder()` were removed; they duplicated `CharTokenizer`.
@@ -126,7 +126,8 @@ URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val
 
 | Feature | Implementation |
 |---------|----------------|
-| Optimizer | AdamW |
+| Optimizer | AdamW with decay on matmul weights and no decay on norms, biases, embeddings |
+| Grad clip | `clip_grad_norm_` via `--grad_clip` (default 1.0; 0 disables) |
 | LR Schedule | Linear warmup → cosine decay |
 | Mixed Precision | FP16 via `torch.amp` (CUDA only) |
 | Compilation | `torch.compile()` (Linux + CUDA only) |
@@ -137,7 +138,8 @@ URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val
 | Feature | Implementation |
 |---------|----------------|
 | Sampling | Multinomial with temperature |
-| Top-k Filtering | Optional nucleus-like sampling |
+| Top-k Filtering | Optional: keep the k highest logits (not nucleus sampling) |
+| Top-p / nucleus | Optional; when both top-k and top-p are set, top-k is applied first |
 | Device Support | Auto-detect or manual override |
 | Repro | Prints tokenizer/seed/torch/git/argv from the checkpoint when present |
 
@@ -154,6 +156,8 @@ URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val
 | `max_iters` | 5000 | Training iterations |
 | `warmup_iters` | 100 | LR warmup iterations |
 | `dropout` | 0.1 | Dropout rate |
+| `grad_clip` | 1.0 | Max gradient L2 norm (0 disables) |
+| `weight_decay` | 0.1 | AdamW decay for matmul weights |
 
 **Resulting Model Size:** ~10-15M parameters
 
@@ -227,8 +231,8 @@ URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val
 - **Type Hints:** Used in configuration classes
 - **Modularity:** Single responsibility per file
 - **Naming:** Descriptive, following PyTorch conventions
-- **Tests:** `unittest` for tokenizer, attention, KV cache, `get_batch`/`get_lr`, checkpoint roundtrip, `prepare_data`, and `sample.py` generate shape
-- **Lint:** Ruff format + lint in CI (`.github/workflows/main.yml`)
+- **Tests:** `unittest` for tokenizer (including char UNK), attention, KV cache, `get_batch`/`get_lr`, checkpoint roundtrip, `--resume`, compiled `_orig_mod.` prefix stripping, top-k/top-p, default `dropout=0.1`, `prepare_data`, and `sample.py` generate shape
+- **Lint:** Ruff format + lint in CI on push to main/master and on all pull requests (`.github/workflows/main.yml`)
 
 ---
 

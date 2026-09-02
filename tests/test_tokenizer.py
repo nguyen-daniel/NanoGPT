@@ -24,6 +24,22 @@ class TestCharTokenizer(unittest.TestCase):
             self.assertEqual(loaded.type, "char")
             self.assertEqual(loaded.decode(loaded.encode(SAMPLE)), SAMPLE)
 
+    def test_unknown_char_maps_to_unk(self):
+        tok = CharTokenizer.train("abc")
+        self.assertIn(CharTokenizer.UNK, tok.vocab)
+        unk_id = tok._char_to_int[CharTokenizer.UNK]
+        ids = tok.encode("abX")
+        self.assertEqual(ids[:2], tok.encode("ab"))
+        self.assertEqual(ids[2], unk_id)
+        # Must not KeyError on characters outside the trained vocab
+        encoded = tok.encode("你好")
+        self.assertEqual(encoded, [unk_id, unk_id])
+
+    def test_unknown_char_without_unk_in_vocab(self):
+        tok = CharTokenizer(vocab=["a", "b"])
+        ids = tok.encode("aXc")
+        self.assertEqual(ids, [0, 0, 0])
+
 
 class TestBPETokenizer(unittest.TestCase):
     def test_roundtrip(self):

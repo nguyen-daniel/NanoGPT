@@ -14,6 +14,58 @@ from dataclasses import dataclass
 # PyTorch 2.0+ SDPA; the backend may dispatch FlashAttention when it provides one.
 SDPA_AVAILABLE = hasattr(F, 'scaled_dot_product_attention')
 
+# torch.compile() wraps modules and prefixes parameter names with this.
+ORIG_MOD_PREFIX = "_orig_mod."
+
+
+def strip_orig_mod_prefix(state_dict):
+    """
+    Remove torch.compile() `_orig_mod.` prefixes from a checkpoint state dict.
+
+    Returns the original mapping when no keys need stripping.
+    """
+    if not any(key.startswith(ORIG_MOD_PREFIX) for key in state_dict):
+        return state_dict
+    stripped = {}
+    for key, value in state_dict.items():
+        if key.startswith(ORIG_MOD_PREFIX):
+            stripped[key[len(ORIG_MOD_PREFIX) :]] = value
+        else:
+            stripped[key] = value
+    return stripped
+
+
+def filter_logits(logits, top_k=None, top_p=None):
+    """
+    Filter next-token logits before softmax.
+
+    Top-k and top-p may be combined. When both are set they apply in order:
+    top-k first (keep the k largest logits), then top-p / nucleus on what remains.
+    Typical top-p values are 0.9–0.95. The nucleus always keeps at least one token.
+    """
+    if top_k is None and top_p is None:
+        return logits
+
+    filtered = logits.clone()
+
+    if top_k is not None:
+        k = min(int(top_k), filtered.size(-1))
+        kth = torch.topk(filtered, k, dim=-1).values[..., -1:]
+        filtered = filtered.masked_fill(filtered < kth, float("-inf"))
+
+    if top_p is not None:
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = False
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+        )
+        filtered = filtered.masked_fill(indices_to_remove, float("-inf"))
+
+    return filtered
+
 
 @dataclass
 class GPTConfig:
@@ -450,10 +502,10 @@ class GPT(nn.Module):
             idx: Starting token indices of shape (batch_size, seq_len)
             max_new_tokens: Maximum number of new tokens to generate
             temperature: Sampling temperature (1.0 = no change, >1.0 = more random, <1.0 = more focused)
-            top_k: If specified, only sample from top-k most likely tokens (None = no filtering)
-            top_p: If specified, use nucleus sampling - keep smallest set of tokens with cumulative
-                   probability >= top_p. Also known as nucleus sampling. (None = no filtering)
-                   Typical values: 0.9-0.95. Cannot be used with top_k.
+            top_k: If specified, only sample from the top-k most likely tokens (None = no top-k)
+            top_p: If specified, nucleus sampling: keep the smallest set of tokens whose
+                   cumulative probability is >= top_p (None = no nucleus filter).
+                   Typical values: 0.9-0.95. May be combined with top_k; top-k is applied first.
 
         Returns:
             Generated token indices of shape (batch_size, seq_len + max_new_tokens)
@@ -464,25 +516,7 @@ class GPT(nn.Module):
             # Focus only on the last time step
             # Shape: (batch_size, vocab_size)
             step_logits = step_logits[:, -1, :] / temperature
-
-            # Apply top-k filtering if specified
-            if top_k is not None:
-                v, _ = torch.topk(step_logits, min(top_k, step_logits.size(-1)))
-                step_logits[step_logits < v[:, [-1]]] = float("-inf")
-
-            # Apply top-p (nucleus) filtering if specified
-            # This keeps the smallest set of tokens with cumulative probability >= top_p
-            if top_p is not None:
-                sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-                )
-                step_logits[indices_to_remove] = float("-inf")
-
+            step_logits = filter_logits(step_logits, top_k=top_k, top_p=top_p)
             probs = torch.softmax(step_logits, dim=-1)
             return torch.multinomial(probs, num_samples=1)
 

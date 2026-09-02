@@ -7,9 +7,9 @@ from pathlib import Path
 
 import torch
 
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, strip_orig_mod_prefix
 from sample import load_checkpoint
-from train import collect_run_metadata, get_batch, get_lr, make_checkpoint
+from train import collect_run_metadata, configure_optimizer, get_batch, get_lr, make_checkpoint
 
 
 class TestGetBatch(unittest.TestCase):
@@ -138,6 +138,11 @@ class TestCheckpointRoundtrip(unittest.TestCase):
 
 
 class TestDropoutConfig(unittest.TestCase):
+    def test_default_dropout_is_point_one(self):
+        self.assertEqual(GPTConfig().dropout, 0.1)
+        cfg = GPTConfig(block_size=16, vocab_size=32, n_layer=1, n_head=2, n_embd=16)
+        self.assertEqual(cfg.dropout, 0.1)
+
     def test_dropout_wired_from_config(self):
         cfg = GPTConfig(
             block_size=16,
@@ -206,6 +211,182 @@ class TestTrainSavesMetadata(unittest.TestCase):
             with torch.no_grad():
                 out = loaded.generate(idx, max_new_tokens=3)
             self.assertEqual(out.shape, (1, 7))
+
+
+def _tiny_corpus_dirs(td: Path):
+    from data import prepare_data
+
+    corpus = "abcdefghijklmnopqrstuvwxyz \n" * 40
+    src = td / "corpus.txt"
+    src.write_text(corpus, encoding="utf-8")
+    data_dir = td / "data"
+    out_dir = td / "out"
+    prepare_data(
+        data_dir=str(data_dir),
+        input_file=str(src),
+        tokenizer_type="char",
+        train_split=0.9,
+    )
+    return data_dir, out_dir
+
+
+def _tiny_train_kwargs(data_dir, out_dir, **overrides):
+    kwargs = dict(
+        data_dir=str(data_dir),
+        out_dir=str(out_dir),
+        block_size=8,
+        batch_size=2,
+        n_layer=1,
+        n_head=2,
+        n_embd=16,
+        max_iters=2,
+        warmup_iters=1,
+        eval_interval=1,
+        eval_iters=1,
+        device="cpu",
+        use_compile=False,
+        use_amp=False,
+        seed=123,
+        dropout=0.0,
+        grad_clip=1.0,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestConfigureOptimizer(unittest.TestCase):
+    def test_decay_and_nodecay_groups(self):
+        config = GPTConfig(
+            block_size=16,
+            vocab_size=32,
+            n_layer=1,
+            n_head=2,
+            n_embd=16,
+            dropout=0.0,
+        )
+        model = GPT(config)
+        opt = configure_optimizer(model, learning_rate=1e-3, weight_decay=0.1)
+        decay = next(g for g in opt.param_groups if g["weight_decay"] > 0)
+        nodecay = next(g for g in opt.param_groups if g["weight_decay"] == 0.0)
+        self.assertEqual(decay["weight_decay"], 0.1)
+
+        ids = [id(p) for g in opt.param_groups for p in g["params"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), sum(1 for p in model.parameters() if p.requires_grad))
+
+        decay_ids = {id(p) for p in decay["params"]}
+        nodecay_ids = {id(p) for p in nodecay["params"]}
+        for name, param in model.named_parameters(remove_duplicate=False):
+            if not param.requires_grad:
+                continue
+            if param.ndim < 2 or "embedding" in name or "ln_" in name or "norm" in name:
+                self.assertIn(id(param), nodecay_ids, name)
+            elif name.startswith("lm_head."):
+                # Tied to token_embedding; classified once as no-decay
+                self.assertIn(id(param), nodecay_ids, name)
+            else:
+                self.assertIn(id(param), decay_ids, name)
+
+
+class TestResume(unittest.TestCase):
+    def test_resume_continues_from_checkpoint(self):
+        from train import train
+
+        with tempfile.TemporaryDirectory() as td:
+            data_dir, out_dir = _tiny_corpus_dirs(Path(td))
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=2))
+            ckpt_path = out_dir / "ckpt.pt"
+            self.assertTrue(ckpt_path.exists())
+            first = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            first_iter = first["iter_num"]
+            first_weights = {k: v.clone() for k, v in first["model"].items()}
+            # Tiny runs may not beat the saved val loss; force the next eval to write.
+            first["best_val_loss"] = float("inf")
+            torch.save(first, ckpt_path)
+
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=4, resume=True))
+            second = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            self.assertGreater(second["iter_num"], first_iter)
+            self.assertFalse(
+                all(torch.equal(first_weights[k], second["model"][k]) for k in first_weights)
+            )
+
+
+class TestOrigModStrip(unittest.TestCase):
+    def _tiny_config(self):
+        return GPTConfig(
+            block_size=16,
+            vocab_size=32,
+            n_layer=1,
+            n_head=2,
+            n_embd=16,
+            dropout=0.0,
+            use_sdpa=True,
+        )
+
+    def test_strip_orig_mod_prefix_roundtrip(self):
+        torch.manual_seed(0)
+        config = self._tiny_config()
+        model = GPT(config)
+        state = model.state_dict()
+        prefixed = {f"_orig_mod.{k}": v.clone() for k, v in state.items()}
+        stripped = strip_orig_mod_prefix(prefixed)
+        self.assertIsNot(stripped, prefixed)
+        self.assertFalse(any(k.startswith("_orig_mod.") for k in stripped))
+        self.assertEqual(set(stripped), set(state))
+
+        other = GPT(config)
+        other.load_state_dict(stripped)
+        idx = torch.randint(0, config.vocab_size, (2, 8))
+        model.eval()
+        other.eval()
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(model(idx), other(idx), atol=1e-6, rtol=1e-5))
+
+        unchanged = strip_orig_mod_prefix(state)
+        self.assertIs(unchanged, state)
+
+    def test_load_checkpoint_strips_orig_mod(self):
+        torch.manual_seed(1)
+        config = self._tiny_config()
+        model = GPT(config)
+        prefixed = {f"_orig_mod.{k}": v.clone() for k, v in model.state_dict().items()}
+        ckpt = make_checkpoint(
+            model,
+            torch.optim.AdamW(model.parameters(), lr=1e-3),
+            config,
+            iter_num=0,
+            best_val_loss=1.0,
+            scaler=None,
+            seed=1,
+            tokenizer_type="char",
+        )
+        ckpt["model"] = prefixed
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            torch.save(ckpt, path)
+            loaded, _ = load_checkpoint(path, torch.device("cpu"))
+            idx = torch.randint(0, config.vocab_size, (1, 8))
+            model.eval()
+            loaded.eval()
+            with torch.no_grad():
+                self.assertTrue(torch.allclose(model(idx), loaded(idx), atol=1e-6, rtol=1e-5))
+
+    def test_resume_loads_compiled_checkpoint_prefix(self):
+        from train import train
+
+        with tempfile.TemporaryDirectory() as td:
+            data_dir, out_dir = _tiny_corpus_dirs(Path(td))
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=2))
+            ckpt_path = out_dir / "ckpt.pt"
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt["model"] = {f"_orig_mod.{k}": v for k, v in ckpt["model"].items()}
+            ckpt["best_val_loss"] = float("inf")
+            torch.save(ckpt, ckpt_path)
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=3, resume=True))
+            resumed = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            self.assertFalse(any(k.startswith("_orig_mod.") for k in resumed["model"]))
+            self.assertGreaterEqual(resumed["iter_num"], ckpt["iter_num"])
 
 
 if __name__ == "__main__":
