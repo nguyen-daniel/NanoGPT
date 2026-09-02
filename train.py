@@ -12,7 +12,7 @@ import platform
 import math
 import torch
 from pathlib import Path
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, strip_orig_mod_prefix
 from data import prepare_data
 from device import detect_device, report_device, set_seed, supports_amp, supports_compile
 
@@ -25,17 +25,40 @@ except ImportError:
     TENSORBOARD_AVAILABLE = False
 
 
-def get_device(device=None):
+def configure_optimizer(model, learning_rate, weight_decay=0.1):
     """
-    Resolve the training device (CUDA, ROCm, DirectML, MPS, or CPU).
+    AdamW with decay on matmul weights and no decay on norms, biases, embeddings.
 
-    Returns:
-        (backend_name, torch.device) for callers that still unpack a pair.
-        Use detect_device() when you need the full DeviceInfo.
+    The tied lm_head shares the token-embedding Parameter, so it is classified
+    once (as an embedding: no decay). Unique parameters only — weight tying
+    must not put the same tensor in both groups.
     """
-    info = detect_device(device)
-    report_device(info)
-    return info.backend, info.device
+    inner = getattr(model, "_orig_mod", model)
+    no_decay_tokens = ("bias", "ln_", "norm", "embedding")
+
+    id_to_names = {}
+    id_to_param = {}
+    for name, param in inner.named_parameters(remove_duplicate=False):
+        if not param.requires_grad:
+            continue
+        pid = id(param)
+        id_to_names.setdefault(pid, []).append(name)
+        id_to_param[pid] = param
+
+    decay, no_decay = [], []
+    for pid, param in id_to_param.items():
+        names = id_to_names[pid]
+        if param.ndim < 2 or any(any(token in name for token in no_decay_tokens) for name in names):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return torch.optim.AdamW(groups, lr=learning_rate)
 
 
 def get_batch_loop(data, block_size, batch_size, device):
@@ -216,6 +239,8 @@ def train(
     use_sdpa=True,
     gradient_checkpointing=False,
     dropout=0.1,
+    grad_clip=1.0,
+    weight_decay=0.1,
 ):
     """
     Main training function.
@@ -243,6 +268,8 @@ def train(
         use_sdpa: Whether to use PyTorch SDPA (F.scaled_dot_product_attention)
         gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
         dropout: Dropout probability for embeddings, attention, and MLP
+        grad_clip: Max gradient norm; 0 disables clipping
+        weight_decay: AdamW decay for matmul weights (norms/biases/embeddings use 0)
     """
     set_seed(seed)
     info = detect_device(device)
@@ -346,8 +373,17 @@ def train(
     elif use_compile:
         print(f"Warning: torch.compile skipped on {platform.system()} / {device_str}.")
 
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = configure_optimizer(model, learning_rate, weight_decay=weight_decay)
+    n_decay = sum(
+        p.numel() for g in optimizer.param_groups if g["weight_decay"] > 0 for p in g["params"]
+    )
+    n_nodecay = sum(
+        p.numel() for g in optimizer.param_groups if g["weight_decay"] == 0 for p in g["params"]
+    )
+    print(
+        f"AdamW: {n_decay:,} decay / {n_nodecay:,} no-decay params; weight_decay={weight_decay}; "
+        f"grad_clip={grad_clip}"
+    )
 
     # Mixed precision: CUDA/ROCm only. DirectML is FP32.
     scaler = torch.cuda.amp.GradScaler() if amp_ok else None
@@ -362,11 +398,11 @@ def train(
             print(f"\nResuming from checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-            # Load model state - handle torch.compile prefix if present
             state_dict = checkpoint['model']
-            if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            stripped = strip_orig_mod_prefix(state_dict)
+            if stripped is not state_dict:
                 print("  Stripping '_orig_mod.' prefix from compiled checkpoint...")
-                state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
+                state_dict = stripped
 
             # Load into model (may need to unwrap if compiled)
             if hasattr(model, '_orig_mod'):
@@ -374,8 +410,10 @@ def train(
             else:
                 model.load_state_dict(state_dict)
 
-            # Load optimizer state
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            except (ValueError, KeyError) as exc:
+                print(f"  Warning: could not load optimizer state ({exc}); using a fresh AdamW")
 
             # Load scaler state if available
             if scaler is not None and checkpoint.get('scaler') is not None:
@@ -423,20 +461,22 @@ def train(
 
         # Forward and backward pass with mixed precision if enabled
         if amp_ok and scaler is not None:
-            # Mixed precision forward pass
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits, loss = model(x, y)
 
-            # Mixed precision backward pass
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+            if grad_clip > 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Standard precision forward and backward pass
             logits, loss = model(x, y)
             optimizer.zero_grad()
             loss.backward()
+            if grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
         # Evaluate periodically
@@ -564,6 +604,18 @@ if __name__ == '__main__':
         '--dropout', type=float, default=0.1, help='Dropout probability (default: 0.1)'
     )
     parser.add_argument(
+        '--grad_clip',
+        type=float,
+        default=1.0,
+        help='Max gradient L2 norm (default: 1.0; 0 disables)',
+    )
+    parser.add_argument(
+        '--weight_decay',
+        type=float,
+        default=0.1,
+        help='AdamW weight decay for matmul weights (default: 0.1; norms/biases/embeddings use 0)',
+    )
+    parser.add_argument(
         '--gradient_checkpointing',
         action='store_true',
         help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)',
@@ -595,4 +647,6 @@ if __name__ == '__main__':
         use_sdpa=not args.no_sdpa,
         gradient_checkpointing=args.gradient_checkpointing,
         dropout=args.dropout,
+        grad_clip=args.grad_clip,
+        weight_decay=args.weight_decay,
     )

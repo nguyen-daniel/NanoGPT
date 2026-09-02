@@ -11,8 +11,9 @@ Decoder-only GPT in PyTorch (Karpathy-style): train on Tiny Shakespeare or your 
 - Attention via **PyTorch SDPA** (`F.scaled_dot_product_attention`); `--no_sdpa` is the manual `QK^T` + causal-mask fallback. SDPA may dispatch a FlashAttention kernel when the backend provides one — this repo does not implement FlashAttention.
 - **DirectML** device path for Windows + AMD (RX 7800 XT); AMP and `torch.compile` are skipped on DirectML (FP32)
 - Vectorized `get_batch()` with optional device-resident tokens (no Python index loop)
-- Character tokenizer by default; optional BPE (`python data.py --tokenizer bpe`)
-- Dropout on `GPTConfig` (`--dropout`); `ckpt.pt` stores tokenizer type, seed, torch version, git SHA, and full argv
+- Character tokenizer by default (unknown chars map to UNK); optional BPE (`python data.py --tokenizer bpe`)
+- Dropout on `GPTConfig` (`--dropout`, default 0.1); AdamW decay vs no-decay groups; `--grad_clip` (default 1.0)
+- `ckpt.pt` stores tokenizer type, seed, torch version, git SHA, and full argv
 
 ## Run
 
@@ -20,7 +21,7 @@ Decoder-only GPT in PyTorch (Karpathy-style): train on Tiny Shakespeare or your 
 git clone https://github.com/nguyen-daniel/NanoGPT.git
 cd NanoGPT
 
-# CPU / CI
+# CPU / CI  (torch>=2.0,<3 and requests>=2.28,<3; not torch-directml)
 pip install -r requirements.txt
 
 python data.py
@@ -51,7 +52,7 @@ Measured on **AMD Radeon RX 7800 XT** (Windows, **DirectML** — not CUDA). Repr
 | Size | Default 6×6×384 is ~10–15M parameters (vocab-dependent); printed at train start | train log |
 | BPE | Sequence length vs char is measured, not assumed | `python benches/bench_bpe.py` → `results/bpe_compression.json` |
 | Batching | Vectorized gather; optional device-resident tokens | `get_batch()` vs `get_batch_loop()` in `train.py` |
-| Train loop | `get_batch` / `get_lr` / checkpoint roundtrip / `prepare_data` / sample generate shape | `tests/test_train.py`, `tests/test_data.py`, `tests/test_sample.py` |
+| Train loop | `get_batch` / `get_lr` / checkpoint roundtrip / `--resume` / `_orig_mod` strip / `prepare_data` / sample generate + top-k/top-p | `tests/test_train.py`, `tests/test_data.py`, `tests/test_sample.py` |
 
 No 2–4× memory or 40% data-loading claims. If you run `make bench`, treat the JSON as the only numbers.
 

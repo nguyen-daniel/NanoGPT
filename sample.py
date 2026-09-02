@@ -7,16 +7,9 @@ Automatically detects tokenizer type (character or BPE) from the data directory.
 import torch
 import argparse
 from pathlib import Path
-from model import GPT
+from model import GPT, strip_orig_mod_prefix
 from tokenizer import load_tokenizer
 from device import detect_device, report_device
-
-
-def get_device(device=None):
-    """Resolve CUDA, ROCm, DirectML, MPS, or CPU for inference."""
-    info = detect_device(device)
-    report_device(info)
-    return info.backend, info.device
 
 
 def load_checkpoint(checkpoint_path, device):
@@ -56,21 +49,11 @@ def load_checkpoint(checkpoint_path, device):
     # Initialize model
     model = GPT(config)
 
-    # Load state dict - handle both compiled and uncompiled checkpoints
     state_dict = checkpoint['model']
-
-    # If checkpoint was saved from a compiled model, strip '_orig_mod.' prefix
-    # torch.compile() wraps the model and adds this prefix to parameter names
-    if any(key.startswith('_orig_mod.') for key in state_dict.keys()):
+    stripped = strip_orig_mod_prefix(state_dict)
+    if stripped is not state_dict:
         print("Detected compiled model checkpoint, stripping '_orig_mod.' prefix...")
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                new_key = key[len('_orig_mod.') :]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
-        state_dict = new_state_dict
+        state_dict = stripped
 
     model.load_state_dict(state_dict)
     model = model.to(device)
@@ -131,13 +114,15 @@ def generate_text(
         prompt: Starting text prompt
         num_tokens: Number of new tokens to generate
         temperature: Sampling temperature (1.0 = default, >1.0 = more random, <1.0 = more focused)
-        top_k: If specified, only sample from top-k most likely tokens
-        top_p: If specified, use nucleus sampling (keep tokens with cumulative prob >= top_p)
+        top_k: If specified, only sample from the top-k most likely tokens
+        top_p: If specified, nucleus sampling (keep tokens with cumulative prob >= top_p).
+               Combined with top_k, top-k is applied first, then top-p.
         data_dir: Directory containing vocabulary data
         device: Device to run generation on (None = auto-detect, 'cuda', 'mps', or 'cpu')
     """
-    # Determine device
-    device_str, device_obj = get_device(device)
+    info = detect_device(device)
+    report_device(info)
+    device_obj = info.device
 
     # Load vocabulary
     vocab = load_vocabulary(data_dir)
@@ -196,13 +181,16 @@ if __name__ == '__main__':
         '--temperature', type=float, default=1.0, help='Sampling temperature (default: 1.0)'
     )
     parser.add_argument(
-        '--top_k', type=int, default=None, help='Top-k sampling (default: None, no filtering)'
+        '--top_k',
+        type=int,
+        default=None,
+        help='Top-k sampling (default: None). Applied before top-p when both are set.',
     )
     parser.add_argument(
         '--top_p',
         type=float,
         default=None,
-        help='Top-p (nucleus) sampling - keep tokens with cumulative prob >= p (default: None)',
+        help='Top-p / nucleus sampling (default: None). Applied after top-k when both are set.',
     )
     parser.add_argument(
         '--data_dir',
