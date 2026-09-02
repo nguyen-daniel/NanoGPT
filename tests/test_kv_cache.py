@@ -38,7 +38,7 @@ class TestKVCache(unittest.TestCase):
         self.assertEqual(full.shape, cached.shape)
         self.assertTrue(
             torch.allclose(full, cached, atol=1e-4, rtol=1e-4),
-            f"max abs diff={ (full - cached).abs().max().item() }",
+            f"max abs diff={(full - cached).abs().max().item()}",
         )
 
     def test_cached_vs_full_sdpa_token_by_token(self):

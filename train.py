@@ -6,10 +6,11 @@ Supports resuming from checkpoints and optional TensorBoard logging.
 """
 
 import os
+import sys
+import subprocess
 import platform
 import math
 import torch
-import torch.nn as nn
 from pathlib import Path
 from model import GPT, GPTConfig
 from data import prepare_data
@@ -18,6 +19,7 @@ from device import detect_device, report_device, set_seed, supports_amp, support
 # Optional TensorBoard support (built into PyTorch, no extra install needed)
 try:
     from torch.utils.tensorboard import SummaryWriter
+
     TENSORBOARD_AVAILABLE = True
 except ImportError:
     TENSORBOARD_AVAILABLE = False
@@ -70,28 +72,82 @@ def get_batch(data, block_size, batch_size, device):
     return x, y
 
 
+def _git_sha():
+    """Best-effort HEAD SHA for the checkpoint; None if git is unavailable."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def collect_run_metadata(seed, tokenizer_type, argv=None):
+    """
+    Fields stored in ckpt.pt so a run can be reproduced from the file alone.
+
+    Returns tokenizer type, seed, torch version, git SHA, and the full argv.
+    """
+    if argv is None:
+        argv = sys.argv
+    return {
+        "tokenizer_type": tokenizer_type,
+        "seed": seed,
+        "torch_version": torch.__version__,
+        "git_sha": _git_sha(),
+        "argv": list(argv),
+    }
+
+
+def make_checkpoint(
+    model,
+    optimizer,
+    config,
+    iter_num,
+    best_val_loss,
+    scaler,
+    seed,
+    tokenizer_type,
+    argv=None,
+):
+    """Build the dict written to out/ckpt.pt (weights + optimizer + run metadata)."""
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": config,
+        "iter_num": iter_num,
+        "best_val_loss": best_val_loss,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+    }
+    checkpoint.update(collect_run_metadata(seed, tokenizer_type, argv=argv))
+    return checkpoint
+
+
 def get_lr(it, learning_rate, warmup_iters, max_iters, min_lr):
     """
     Get learning rate with linear warmup and cosine decay.
-    
+
     Args:
         it: Current iteration number
         learning_rate: Maximum learning rate
         warmup_iters: Number of warmup iterations
         max_iters: Maximum number of iterations
         min_lr: Minimum learning rate (as fraction of max_lr)
-    
+
     Returns:
         Current learning rate
     """
     # Linear warmup
     if it < warmup_iters:
         return learning_rate * (it + 1) / warmup_iters
-    
+
     # Cosine decay
     if it > max_iters:
         return min_lr * learning_rate
-    
+
     # Cosine decay from max_lr to min_lr
     decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
@@ -99,10 +155,12 @@ def get_lr(it, learning_rate, warmup_iters, max_iters, min_lr):
 
 
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device, use_amp=False):
+def estimate_loss(
+    model, train_data, val_data, block_size, batch_size, eval_iters, device, use_amp=False
+):
     """
     Estimate the loss on train and validation sets.
-    
+
     Args:
         model: GPT model
         train_data: Training data tensor
@@ -112,13 +170,13 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iter
         eval_iters: Number of iterations to average over
         device: Device to run evaluation on
         use_amp: Whether to use automatic mixed precision
-    
+
     Returns:
         Dictionary with 'train' and 'val' loss values
     """
     model.eval()
     out = {}
-    
+
     for split, data in [('train', train_data), ('val', val_data)]:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
@@ -130,7 +188,7 @@ def estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iter
                 _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
-    
+
     model.train()
     return out
 
@@ -156,11 +214,12 @@ def train(
     resume=False,
     use_tensorboard=False,
     use_sdpa=True,
-    gradient_checkpointing=False
+    gradient_checkpointing=False,
+    dropout=0.1,
 ):
     """
     Main training function.
-    
+
     Args:
         data_dir: Directory containing processed data
         block_size: Context length (sequence length)
@@ -183,6 +242,7 @@ def train(
         use_tensorboard: Whether to log metrics to TensorBoard
         use_sdpa: Whether to use PyTorch SDPA (F.scaled_dot_product_attention)
         gradient_checkpointing: Whether to use gradient checkpointing to save memory (trades compute for memory)
+        dropout: Dropout probability for embeddings, attention, and MLP
     """
     set_seed(seed)
     info = detect_device(device)
@@ -191,12 +251,16 @@ def train(
     device_obj = info.device
     amp_ok = use_amp and supports_amp(info)
     compile_ok = use_compile and supports_compile(info)
-    is_amd_gpu = info.backend in ("rocm", "directml") or "radeon" in info.name.lower() or "amd" in info.name.lower()
-    
+    is_amd_gpu = (
+        info.backend in ("rocm", "directml")
+        or "radeon" in info.name.lower()
+        or "amd" in info.name.lower()
+    )
+
     # Load data
     print("Loading data...")
     data_path = Path(data_dir)
-    
+
     # Check if data files exist, if not prepare them
     if not (data_path / 'train.pt').exists() or not (data_path / 'vocab.pt').exists():
         print("Data files not found. Preparing data...")
@@ -204,13 +268,15 @@ def train(
         train_data = data_dict['train_data']
         val_data = data_dict['val_data']
         vocab_size = data_dict['vocab_size']
+        tokenizer_type = data_dict['tokenizer'].type
     else:
         print("Loading preprocessed data...")
         train_data = torch.load(data_path / 'train.pt')
         val_data = torch.load(data_path / 'val.pt')
         vocab_metadata = torch.load(data_path / 'vocab.pt')
         vocab_size = vocab_metadata['vocab_size']
-    
+        tokenizer_type = vocab_metadata.get('tokenizer_type', 'char')
+
     # Keep tokens on the training device so get_batch() is a GPU gather,
     # not a Python loop + H2D copy. Tiny Shakespeare fits in a few MB.
     try:
@@ -224,10 +290,10 @@ def train(
     print(f"Training data: {len(train_data):,} tokens")
     print(f"Validation data: {len(val_data):,} tokens")
     print(f"Vocabulary size: {vocab_size}")
-    
+
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
-    
+
     # Initialize TensorBoard writer if requested
     writer = None
     if use_tensorboard:
@@ -238,7 +304,7 @@ def train(
             print(f"  View with: tensorboard --logdir {log_dir}")
         else:
             print("Warning: TensorBoard requested but torch.utils.tensorboard not available")
-    
+
     # Initialize model
     print("\nInitializing model...")
     config = GPTConfig(
@@ -248,27 +314,30 @@ def train(
         n_head=n_head,
         n_embd=n_embd,
         use_sdpa=use_sdpa,
-        gradient_checkpointing=gradient_checkpointing
+        gradient_checkpointing=gradient_checkpointing,
+        dropout=dropout,
     )
     model = GPT(config)
     model = model.to(device_obj)
-    
+
     # Print model parameters
     n_params = model.get_num_params() / 1e6
     print(f"Model initialized with {n_params:.2f}M parameters")
-    
+    print(f"Tokenizer: {tokenizer_type}; dropout={dropout}")
+
     from model import SDPA_AVAILABLE
+
     if use_sdpa and SDPA_AVAILABLE:
         print("SDPA enabled (F.scaled_dot_product_attention; backend may dispatch FlashAttention)")
     elif use_sdpa and not SDPA_AVAILABLE:
         print("SDPA requested but not available (requires PyTorch 2.0+); using manual attention")
     else:
         print("SDPA disabled (using manual attention)")
-    
+
     # Report gradient checkpointing status
     if gradient_checkpointing:
         print("Gradient checkpointing enabled (trading compute for ~50% memory reduction)")
-    
+
     # Apply torch.compile only on Linux CUDA/ROCm
     if compile_ok:
         print("Compiling model with torch.compile...")
@@ -276,52 +345,52 @@ def train(
         print("Model compiled successfully")
     elif use_compile:
         print(f"Warning: torch.compile skipped on {platform.system()} / {device_str}.")
-    
+
     # Initialize optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    
+
     # Mixed precision: CUDA/ROCm only. DirectML is FP32.
     scaler = torch.cuda.amp.GradScaler() if amp_ok else None
-    
+
     # Resume from checkpoint if requested
     start_iter = 0
     best_val_loss = float('inf')
-    
+
     if resume:
         checkpoint_path = Path(out_dir) / 'ckpt.pt'
         if checkpoint_path.exists():
             print(f"\nResuming from checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            
+
             # Load model state - handle torch.compile prefix if present
             state_dict = checkpoint['model']
             if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
                 print("  Stripping '_orig_mod.' prefix from compiled checkpoint...")
                 state_dict = {k.replace('_orig_mod.', '', 1): v for k, v in state_dict.items()}
-            
+
             # Load into model (may need to unwrap if compiled)
             if hasattr(model, '_orig_mod'):
                 model._orig_mod.load_state_dict(state_dict)
             else:
                 model.load_state_dict(state_dict)
-            
+
             # Load optimizer state
             optimizer.load_state_dict(checkpoint['optimizer'])
-            
+
             # Load scaler state if available
             if scaler is not None and checkpoint.get('scaler') is not None:
                 scaler.load_state_dict(checkpoint['scaler'])
-            
+
             # Resume from next iteration
             start_iter = checkpoint['iter_num'] + 1
             best_val_loss = checkpoint['best_val_loss']
-            
+
             print(f"  Resumed at iteration {start_iter}")
             print(f"  Best validation loss so far: {best_val_loss:.4f}")
         else:
             print(f"\nWarning: --resume specified but no checkpoint found at {checkpoint_path}")
             print("  Starting training from scratch...")
-    
+
     # Training loop
     print(f"\nStarting training on {device_str} ({info.name})...")
     print(f"Max iterations: {max_iters}")
@@ -335,15 +404,15 @@ def train(
     if resume and start_iter > 0:
         print(f"Resuming from iteration {start_iter}")
     print("-" * 60)
-    
+
     iter_num = start_iter
-    
+
     while iter_num < max_iters:
         # Update learning rate with warmup and cosine decay
         lr = get_lr(iter_num, learning_rate, warmup_iters, max_iters, min_lr)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        
+
         # Sample a batch of data
         x, y = get_batch(train_data, block_size, batch_size, device_obj)
         if iter_num == start_iter:
@@ -357,7 +426,7 @@ def train(
             # Mixed precision forward pass
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 logits, loss = model(x, y)
-            
+
             # Mixed precision backward pass
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -369,40 +438,46 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        
+
         # Evaluate periodically
         if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, amp_ok)
+            losses = estimate_loss(
+                model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, amp_ok
+            )
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
-            
+            print(
+                f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}"
+            )
+
             # Log to TensorBoard
             if writer is not None:
                 writer.add_scalar('Loss/train', losses['train'], iter_num)
                 writer.add_scalar('Loss/val', losses['val'], iter_num)
                 writer.add_scalar('LearningRate', current_lr, iter_num)
-            
+
             # Save checkpoint if validation loss improved
             if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'config': config,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'scaler': scaler.state_dict() if scaler is not None else None,
-                }
+                checkpoint = make_checkpoint(
+                    model,
+                    optimizer,
+                    config,
+                    iter_num,
+                    best_val_loss,
+                    scaler,
+                    seed,
+                    tokenizer_type,
+                )
                 checkpoint_path = Path(out_dir) / 'ckpt.pt'
                 torch.save(checkpoint, checkpoint_path)
                 print(f"  -> Checkpoint saved (val loss: {best_val_loss:.4f})")
-        
+
         iter_num += 1
-    
+
     # Close TensorBoard writer
     if writer is not None:
         writer.close()
-    
+
     print("\n" + "=" * 60)
     print("Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
@@ -413,53 +488,89 @@ def train(
 
 if __name__ == '__main__':
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Train NanoGPT model')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device to use (cuda/directml/mps/cpu, default: auto-detect)')
-    parser.add_argument('--seed', type=int, default=1337,
-                        help='RNG seed (default: 1337)')
-    parser.add_argument('--data_dir', type=str, default='data',
-                        help='Directory containing processed data (default: data)')
-    parser.add_argument('--block_size', type=int, default=256,
-                        help='Context length (default: 256)')
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Batch size (default: 64)')
-    parser.add_argument('--n_layer', type=int, default=6,
-                        help='Number of transformer layers (default: 6)')
-    parser.add_argument('--n_head', type=int, default=6,
-                        help='Number of attention heads (default: 6)')
-    parser.add_argument('--n_embd', type=int, default=384,
-                        help='Embedding dimension (default: 384)')
-    parser.add_argument('--learning_rate', type=float, default=3e-4,
-                        help='Maximum learning rate (default: 3e-4)')
-    parser.add_argument('--max_iters', type=int, default=5000,
-                        help='Maximum training iterations (default: 5000)')
-    parser.add_argument('--warmup_iters', type=int, default=100,
-                        help='Warmup iterations (default: 100)')
-    parser.add_argument('--min_lr', type=float, default=0.1,
-                        help='Minimum learning rate as fraction of max_lr (default: 0.1)')
-    parser.add_argument('--eval_interval', type=int, default=500,
-                        help='Evaluate every N iterations (default: 500)')
-    parser.add_argument('--eval_iters', type=int, default=200,
-                        help='Number of iterations to average loss over (default: 200)')
-    parser.add_argument('--out_dir', type=str, default='out',
-                        help='Output directory for checkpoints (default: out)')
-    parser.add_argument('--no_compile', action='store_true',
-                        help='Disable torch.compile (Linux CUDA only)')
-    parser.add_argument('--no_amp', action='store_true',
-                        help='Disable mixed-precision training (CUDA only)')
-    parser.add_argument('--no_sdpa', action='store_true',
-                        help='Disable PyTorch SDPA (use manual QK^T + causal mask)')
-    parser.add_argument('--resume', action='store_true',
-                        help='Resume training from the latest checkpoint')
-    parser.add_argument('--tensorboard', action='store_true',
-                        help='Enable TensorBoard logging (logs to out_dir/runs/)')
-    parser.add_argument('--gradient_checkpointing', action='store_true',
-                        help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)')
-    
+    parser.add_argument(
+        '--device',
+        type=str,
+        default=None,
+        help='Device to use (cuda/directml/mps/cpu, default: auto-detect)',
+    )
+    parser.add_argument('--seed', type=int, default=1337, help='RNG seed (default: 1337)')
+    parser.add_argument(
+        '--data_dir',
+        type=str,
+        default='data',
+        help='Directory containing processed data (default: data)',
+    )
+    parser.add_argument('--block_size', type=int, default=256, help='Context length (default: 256)')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
+    parser.add_argument(
+        '--n_layer', type=int, default=6, help='Number of transformer layers (default: 6)'
+    )
+    parser.add_argument(
+        '--n_head', type=int, default=6, help='Number of attention heads (default: 6)'
+    )
+    parser.add_argument(
+        '--n_embd', type=int, default=384, help='Embedding dimension (default: 384)'
+    )
+    parser.add_argument(
+        '--learning_rate', type=float, default=3e-4, help='Maximum learning rate (default: 3e-4)'
+    )
+    parser.add_argument(
+        '--max_iters', type=int, default=5000, help='Maximum training iterations (default: 5000)'
+    )
+    parser.add_argument(
+        '--warmup_iters', type=int, default=100, help='Warmup iterations (default: 100)'
+    )
+    parser.add_argument(
+        '--min_lr',
+        type=float,
+        default=0.1,
+        help='Minimum learning rate as fraction of max_lr (default: 0.1)',
+    )
+    parser.add_argument(
+        '--eval_interval', type=int, default=500, help='Evaluate every N iterations (default: 500)'
+    )
+    parser.add_argument(
+        '--eval_iters',
+        type=int,
+        default=200,
+        help='Number of iterations to average loss over (default: 200)',
+    )
+    parser.add_argument(
+        '--out_dir', type=str, default='out', help='Output directory for checkpoints (default: out)'
+    )
+    parser.add_argument(
+        '--no_compile', action='store_true', help='Disable torch.compile (Linux CUDA only)'
+    )
+    parser.add_argument(
+        '--no_amp', action='store_true', help='Disable mixed-precision training (CUDA only)'
+    )
+    parser.add_argument(
+        '--no_sdpa',
+        action='store_true',
+        help='Disable PyTorch SDPA (use manual QK^T + causal mask)',
+    )
+    parser.add_argument(
+        '--resume', action='store_true', help='Resume training from the latest checkpoint'
+    )
+    parser.add_argument(
+        '--tensorboard',
+        action='store_true',
+        help='Enable TensorBoard logging (logs to out_dir/runs/)',
+    )
+    parser.add_argument(
+        '--dropout', type=float, default=0.1, help='Dropout probability (default: 0.1)'
+    )
+    parser.add_argument(
+        '--gradient_checkpointing',
+        action='store_true',
+        help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)',
+    )
+
     args = parser.parse_args()
-    
+
     # Training hyperparameters
     train(
         data_dir=args.data_dir,
@@ -482,6 +593,6 @@ if __name__ == '__main__':
         resume=args.resume,
         use_tensorboard=args.tensorboard,
         use_sdpa=not args.no_sdpa,
-        gradient_checkpointing=args.gradient_checkpointing
+        gradient_checkpointing=args.gradient_checkpointing,
+        dropout=args.dropout,
     )
-

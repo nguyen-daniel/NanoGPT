@@ -84,11 +84,7 @@ def detect_device(requested: str | None = None) -> DeviceInfo:
     def _cuda_info() -> DeviceInfo:
         gpu_name = torch.cuda.get_device_name(0)
         hip = getattr(torch.version, "hip", None)
-        is_amd = (
-            "AMD" in gpu_name.upper()
-            or "RADEON" in gpu_name.upper()
-            or bool(hip)
-        )
+        is_amd = "AMD" in gpu_name.upper() or "RADEON" in gpu_name.upper() or bool(hip)
         backend = "rocm" if is_amd else "cuda"
         return DeviceInfo(backend=backend, device=torch.device("cuda"), name=gpu_name, index=0)
 
@@ -99,33 +95,49 @@ def detect_device(requested: str | None = None) -> DeviceInfo:
             dml_dev, name, idx, _ = _pick_directml()
             return DeviceInfo(backend="directml", device=dml_dev, name=name, index=idx)
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return DeviceInfo(backend="mps", device=torch.device("mps"), name="Apple Silicon", index=0)
-        return DeviceInfo(backend="cpu", device=torch.device("cpu"), name=platform.processor() or "CPU")
+            return DeviceInfo(
+                backend="mps", device=torch.device("mps"), name="Apple Silicon", index=0
+            )
+        return DeviceInfo(
+            backend="cpu", device=torch.device("cpu"), name=platform.processor() or "CPU"
+        )
 
     if req == "cuda":
         if torch.cuda.is_available():
             return _cuda_info()
         print("Warning: CUDA/ROCm requested but not available. Falling back.")
-        return detect_device(None) if _directml_available() else DeviceInfo(
-            backend="cpu", device=torch.device("cpu"), name="CPU (CUDA unavailable)"
+        return (
+            detect_device(None)
+            if _directml_available()
+            else DeviceInfo(
+                backend="cpu", device=torch.device("cpu"), name="CPU (CUDA unavailable)"
+            )
         )
 
     if req == "directml":
         if _directml_available():
             dml_dev, name, idx, _ = _pick_directml()
             return DeviceInfo(backend="directml", device=dml_dev, name=name, index=idx)
-        print("Warning: DirectML requested but torch-directml is not installed. Falling back to CPU.")
+        print(
+            "Warning: DirectML requested but torch-directml is not installed. Falling back to CPU."
+        )
         print("  Install (Python 3.11): pip install torch-directml")
-        return DeviceInfo(backend="cpu", device=torch.device("cpu"), name="CPU (DirectML unavailable)")
+        return DeviceInfo(
+            backend="cpu", device=torch.device("cpu"), name="CPU (DirectML unavailable)"
+        )
 
     if req == "mps":
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return DeviceInfo(backend="mps", device=torch.device("mps"), name="Apple Silicon", index=0)
+            return DeviceInfo(
+                backend="mps", device=torch.device("mps"), name="Apple Silicon", index=0
+            )
         print("Warning: MPS requested but not available. Falling back to CPU.")
         return DeviceInfo(backend="cpu", device=torch.device("cpu"), name="CPU (MPS unavailable)")
 
     if req == "cpu":
-        return DeviceInfo(backend="cpu", device=torch.device("cpu"), name=platform.processor() or "CPU")
+        return DeviceInfo(
+            backend="cpu", device=torch.device("cpu"), name=platform.processor() or "CPU"
+        )
 
     print(f"Warning: Unknown device '{requested}'. Auto-detecting.")
     return detect_device(None)

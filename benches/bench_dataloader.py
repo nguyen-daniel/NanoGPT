@@ -127,9 +127,13 @@ def main():
 
     print("\n=== Data-loading benchmark ===")
     print(f"loop+to(device):     {loop_s * 1e3:.3f} ms/batch")
-    print(f"vectorized+to:       {vec_s * 1e3:.3f} ms/batch  ({reduction_vec_vs_loop * 100:.1f}% vs loop)")
+    print(
+        f"vectorized+to:       {vec_s * 1e3:.3f} ms/batch  ({reduction_vec_vs_loop * 100:.1f}% vs loop)"
+    )
     if gpu_s is not None:
-        print(f"device-resident:     {gpu_s * 1e3:.3f} ms/batch  ({reduction_best_vs_loop * 100:.1f}% vs loop)")
+        print(
+            f"device-resident:     {gpu_s * 1e3:.3f} ms/batch  ({reduction_best_vs_loop * 100:.1f}% vs loop)"
+        )
     print(f"Resume 40% claim met: {result['claim_met']}")
     print(f"Wrote {out_path}")
 

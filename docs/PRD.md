@@ -90,25 +90,27 @@ To provide the clearest possible implementation of a GPT-style transformer, enab
 
 ### 4.2 Core Components
 
-#### 4.2.1 Data Pipeline (`data.py`)
+#### 4.2.1 Data Pipeline (`data.py` + `tokenizer.py`)
 
 | Component | Responsibility |
 |-----------|----------------|
 | `download_shakespeare()` | Fetch Tiny Shakespeare dataset from GitHub |
-| `get_vocabulary()` | Extract unique characters for tokenization |
-| `create_encoder_decoder()` | Build char↔int mapping functions |
-| `prepare_data()` | Orchestrate full pipeline, save train/val splits |
+| `load_custom_file()` | Validate a user-supplied corpus path |
+| `CharTokenizer` / `BPETokenizer` | Tokenize (`tokenizer.py`); char by default, optional BPE |
+| `prepare_data()` | Orchestrate full pipeline, save train/val splits and `vocab.pt` |
+
+`get_vocabulary()` and `create_encoder_decoder()` were removed; they duplicated `CharTokenizer`.
 
 **Data Flow:**
 ```
-URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
+URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val.pt + vocab.pt
 ```
 
 #### 4.2.2 Model Architecture (`model.py`)
 
 | Class | Purpose |
 |-------|---------|
-| `GPTConfig` | Dataclass holding all hyperparameters |
+| `GPTConfig` | Dataclass holding all hyperparameters (including `dropout`) |
 | `CausalSelfAttention` | Multi-head attention with causal masking |
 | `MLP` | Feedforward network (GELU activation) |
 | `Block` | Transformer block (attention + MLP + residuals) |
@@ -118,16 +120,17 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 - Pre-LayerNorm (more stable than post-norm)
 - Weight tying between token embedding and output projection
 - Learnable positional embeddings (not sinusoidal)
+- Dropout is a `GPTConfig` field (`--dropout` in `train.py`); default 0.1
 
 #### 4.2.3 Training Loop (`train.py`)
 
 | Feature | Implementation |
 |---------|----------------|
-| Optimizer | AdamW with weight decay |
+| Optimizer | AdamW |
 | LR Schedule | Linear warmup → cosine decay |
 | Mixed Precision | FP16 via `torch.amp` (CUDA only) |
 | Compilation | `torch.compile()` (Linux + CUDA only) |
-| Checkpointing | Save best model by validation loss |
+| Checkpointing | Save best model by validation loss; `ckpt.pt` also stores tokenizer type, seed, torch version, git SHA, and full argv |
 
 #### 4.2.4 Inference (`sample.py`)
 
@@ -136,6 +139,7 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 | Sampling | Multinomial with temperature |
 | Top-k Filtering | Optional nucleus-like sampling |
 | Device Support | Auto-detect or manual override |
+| Repro | Prints tokenizer/seed/torch/git/argv from the checkpoint when present |
 
 ### 4.3 Default Hyperparameters
 
@@ -223,6 +227,8 @@ URL → input.txt → vocabulary extraction → encode → train.pt + val.pt
 - **Type Hints:** Used in configuration classes
 - **Modularity:** Single responsibility per file
 - **Naming:** Descriptive, following PyTorch conventions
+- **Tests:** `unittest` for tokenizer, attention, KV cache, `get_batch`/`get_lr`, checkpoint roundtrip, `prepare_data`, and `sample.py` generate shape
+- **Lint:** Ruff format + lint in CI (`.github/workflows/main.yml`)
 
 ---
 

@@ -1,4 +1,4 @@
-.PHONY: data train sample bench bench-cpu smoke
+.PHONY: data train sample bench bench-cpu smoke lint test
 
 PYTHON ?= python
 
@@ -23,3 +23,10 @@ bench-cpu:
 
 smoke:
 	$(PYTHON) -c "from train import train; train(max_iters=5, eval_interval=5, eval_iters=1, use_compile=False, use_amp=False, device='cpu')"
+
+lint:
+	$(PYTHON) -m ruff format --check .
+	$(PYTHON) -m ruff check .
+
+test:
+	$(PYTHON) -m unittest discover -s tests -v
