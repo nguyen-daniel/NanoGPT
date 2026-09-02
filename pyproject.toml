@@ -1,0 +1,19 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["data", "out", "results"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length: existing comments/prints are long; format wraps new code
+    "E402",  # late imports used for optional backends (SDPA, TensorBoard)
+    "W291",  # trailing whitespace in existing files; format check covers new code
+    "W293",  # blank-line whitespace in existing files
+]
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

@@ -164,7 +164,9 @@ def main():
 
     print("\n=== Attention memory/speed benchmark ===")
     print(f"SDPA   time: {sdpa['seconds_per_fwd'] * 1e3:.2f} ms   peak={sdpa['cuda_peak_bytes']}")
-    print(f"Manual time: {manual['seconds_per_fwd'] * 1e3:.2f} ms   peak={manual['cuda_peak_bytes']}")
+    print(
+        f"Manual time: {manual['seconds_per_fwd'] * 1e3:.2f} ms   peak={manual['cuda_peak_bytes']}"
+    )
     print(f"Peak memory ratio (manual/SDPA): {ratio}")
     print(f"Theoretical attn matrix: {result['theoretical_attn_matrix_mib']:.2f} MiB")
     print(f"Resume 2–4x claim met (CUDA peak): {result['claim_met']}")

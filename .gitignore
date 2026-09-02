@@ -91,6 +91,7 @@ desktop.ini
 htmlcov/
 .tox/
 .hypothesis/
+.ruff_cache/
 
 # MyPy
 .mypy_cache/
