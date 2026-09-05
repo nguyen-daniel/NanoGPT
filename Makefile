@@ -1,6 +1,7 @@
-.PHONY: data train sample bench bench-cpu smoke lint test
+.PHONY: data train sample demo bench bench-cpu smoke lint test
 
 PYTHON ?= python
+DEMO_CKPT ?= out_demo/ckpt.pt
 
 data:
 	$(PYTHON) data.py
@@ -10,6 +11,12 @@ train:
 
 sample:
 	$(PYTHON) sample.py --num_tokens 50
+
+# Recruiter path: download the CPU 6x6x192 ckpt if missing, print ROMEO: text.
+# Does not train. Weights live on the demo-ckpt-cpu-6x6x192 GitHub Release.
+demo:
+	$(PYTHON) scripts/download_demo_ckpt.py --out $(DEMO_CKPT)
+	$(PYTHON) sample.py --checkpoint $(DEMO_CKPT) --prompt "ROMEO:" --num_tokens 200 --temperature 0.8 --top_k 40 --device cpu
 
 bench:
 	$(PYTHON) benches/bench_attention.py

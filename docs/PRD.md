@@ -208,11 +208,14 @@ URL or --input_file → text → CharTokenizer / BPETokenizer → train.pt + val
 
 ### 6.1 Performance
 
+Throughput and latency numbers need a measured artifact. This repo does not claim FlashAttention, 100 iter/s, or &lt;10ms/token.
+
 | Metric | Target | Current |
 |--------|--------|---------|
-| Training throughput | > 100 iter/s on modern GPU | ✅ Achieved |
-| Memory efficiency | Train on 8GB VRAM | ✅ Achieved |
-| Inference latency | < 10ms per token on GPU | ✅ Achieved |
+| Training throughput | Measure before claiming | 🔲 No artifact (do not treat “100 iter/s” as achieved) |
+| Memory efficiency | Train on a consumer GPU | 🔲 Default 6×6×384 runs here; no published 8GB VRAM study |
+| Inference latency | Measure before claiming | 🔲 No artifact (do not treat “&lt;10ms/token” as achieved) |
+| CPU val (demo ckpt) | Readable Shakespeare-ish text | 1.71 at iter 4750 on 6×6×192 (`results/train_run.json`) |
 
 ### 6.2 Compatibility
 

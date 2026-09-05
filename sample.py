@@ -8,27 +8,18 @@ import torch
 import argparse
 from pathlib import Path
 from model import GPT, strip_orig_mod_prefix
-from tokenizer import load_tokenizer
+from tokenizer import CharTokenizer, load_tokenizer
 from device import detect_device, report_device
 
 
-def load_checkpoint(checkpoint_path, device):
-    """
-    Load model checkpoint and configuration.
-
-    Args:
-        checkpoint_path: Path to the checkpoint file
-        device: Device to load the model on
-
-    Returns:
-        model: Loaded GPT model
-        config: GPTConfig used for the model
-    """
+def read_checkpoint(checkpoint_path):
+    """Load a ckpt.pt dict on CPU. DirectML rejects map_location=dml_device."""
     print(f"Loading checkpoint from {checkpoint_path}...")
-    # DirectML rejects map_location=dml_device; load on CPU then .to(device).
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-    # Extract configuration
+
+def model_from_checkpoint(checkpoint, device):
+    """Build a GPT from an already-loaded checkpoint dict."""
     config = checkpoint['config']
     if not hasattr(config, 'dropout'):
         config.dropout = 0.1
@@ -45,8 +36,9 @@ def load_checkpoint(checkpoint_path, device):
         argv = checkpoint.get('argv')
         if argv:
             print(f"  argv: {argv}")
+    if checkpoint.get('vocab') is not None:
+        print(f"  checkpoint vocab: {len(checkpoint['vocab'])} chars (preferred over data/vocab.pt)")
 
-    # Initialize model
     model = GPT(config)
 
     state_dict = checkpoint['model']
@@ -61,6 +53,84 @@ def load_checkpoint(checkpoint_path, device):
 
     print(f"Model loaded successfully ({model.get_num_params() / 1e6:.2f}M parameters)")
     return model, config
+
+
+def load_checkpoint(checkpoint_path, device):
+    """
+    Load model checkpoint and configuration.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        device: Device to load the model on
+
+    Returns:
+        model: Loaded GPT model
+        config: GPTConfig used for the model
+    """
+    checkpoint = read_checkpoint(checkpoint_path)
+    return model_from_checkpoint(checkpoint, device)
+
+
+def load_tokenizer_for_checkpoint(checkpoint, data_dir='data'):
+    """
+    Tokenizer that matches the checkpoint.
+
+    Prefer the char vocab stored in ckpt.pt. Current data/vocab.pt is 66
+    (UNK at id 0); older Tiny Shakespeare runs used 65 chars with a shifted
+    id map. Mixing them produces garbage text.
+    """
+    config = checkpoint['config']
+    ckpt_vocab = checkpoint.get('vocab')
+    tokenizer_type = checkpoint.get('tokenizer_type', 'char')
+
+    if ckpt_vocab is not None and tokenizer_type == 'char':
+        tokenizer = CharTokenizer(vocab=ckpt_vocab)
+        print(
+            f"Tokenizer from checkpoint: {tokenizer.type}, vocab_size={tokenizer.vocab_size}"
+        )
+        if tokenizer.vocab_size != config.vocab_size:
+            print(
+                f"Warning: checkpoint vocab length {tokenizer.vocab_size} "
+                f"!= config.vocab_size {config.vocab_size}"
+            )
+        return tokenizer
+
+    data_path = Path(data_dir)
+    vocab_path = data_path / 'vocab.pt'
+    if vocab_path.exists():
+        tokenizer = load_tokenizer(vocab_path)
+        print(f"Tokenizer from {vocab_path}: {tokenizer.type}, vocab_size={tokenizer.vocab_size}")
+        if tokenizer.vocab_size != config.vocab_size:
+            # Historical 65-char Tiny Shakespeare (pre-UNK) vs current 66+UNK.
+            text_path = data_path / 'input.txt'
+            if tokenizer_type == 'char' and config.vocab_size == 65 and text_path.exists():
+                text = text_path.read_text(encoding='utf-8')
+                recovered = sorted(set(text))
+                if len(recovered) == 65:
+                    print(
+                        "data/vocab.pt does not match this 65-char checkpoint; "
+                        "rebuilt the pre-UNK Tiny Shakespeare vocab from input.txt."
+                    )
+                    return CharTokenizer(vocab=recovered)
+            raise ValueError(
+                f"Tokenizer vocab_size {tokenizer.vocab_size} != checkpoint "
+                f"config.vocab_size {config.vocab_size}. Re-prepare data to match "
+                "the checkpoint, or use a ckpt.pt that stores `vocab`."
+            )
+        return tokenizer
+
+    text_path = data_path / 'input.txt'
+    if tokenizer_type == 'char' and config.vocab_size == 65 and text_path.exists():
+        text = text_path.read_text(encoding='utf-8')
+        recovered = sorted(set(text))
+        if len(recovered) == 65:
+            print("Rebuilt pre-UNK Tiny Shakespeare vocab from input.txt (no vocab in ckpt).")
+            return CharTokenizer(vocab=recovered)
+
+    raise FileNotFoundError(
+        f"No tokenizer for this checkpoint. Expected `vocab` in the checkpoint "
+        f"or {vocab_path}. Run data.py, or use the shipped demo ckpt that stores vocab."
+    )
 
 
 def load_vocabulary(data_dir='data'):
@@ -124,13 +194,12 @@ def generate_text(
     report_device(info)
     device_obj = info.device
 
-    # Load vocabulary
-    vocab = load_vocabulary(data_dir)
-    encode = vocab['encode']
-    decode = vocab['decode']
+    checkpoint = read_checkpoint(checkpoint_path)
+    tokenizer = load_tokenizer_for_checkpoint(checkpoint, data_dir)
+    encode = tokenizer.encode
+    decode = tokenizer.decode
 
-    # Load model
-    model, config = load_checkpoint(checkpoint_path, device_obj)
+    model, config = model_from_checkpoint(checkpoint, device_obj)
 
     # Encode the prompt
     print(f"\nPrompt: {repr(prompt)}")
