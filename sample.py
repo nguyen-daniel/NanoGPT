@@ -37,7 +37,9 @@ def model_from_checkpoint(checkpoint, device):
         if argv:
             print(f"  argv: {argv}")
     if checkpoint.get('vocab') is not None:
-        print(f"  checkpoint vocab: {len(checkpoint['vocab'])} chars (preferred over data/vocab.pt)")
+        print(
+            f"  checkpoint vocab: {len(checkpoint['vocab'])} chars (preferred over data/vocab.pt)"
+        )
 
     model = GPT(config)
 
@@ -85,9 +87,7 @@ def load_tokenizer_for_checkpoint(checkpoint, data_dir='data'):
 
     if ckpt_vocab is not None and tokenizer_type == 'char':
         tokenizer = CharTokenizer(vocab=ckpt_vocab)
-        print(
-            f"Tokenizer from checkpoint: {tokenizer.type}, vocab_size={tokenizer.vocab_size}"
-        )
+        print(f"Tokenizer from checkpoint: {tokenizer.type}, vocab_size={tokenizer.vocab_size}")
         if tokenizer.vocab_size != config.vocab_size:
             print(
                 f"Warning: checkpoint vocab length {tokenizer.vocab_size} "

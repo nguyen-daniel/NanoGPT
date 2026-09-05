@@ -22,8 +22,7 @@ from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_URL = (
-    "https://github.com/nguyen-daniel/NanoGPT/releases/download/"
-    "demo-ckpt-cpu-6x6x192/ckpt.pt"
+    "https://github.com/nguyen-daniel/NanoGPT/releases/download/demo-ckpt-cpu-6x6x192/ckpt.pt"
 )
 DEFAULT_OUT = ROOT / "out_demo" / "ckpt.pt"
 
