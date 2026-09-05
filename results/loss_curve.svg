@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="460" viewBox="0 0 840 460" role="img" aria-labelledby="title desc">
+  <title id="title">NanoGPT eval: trusted CPU vs untrusted DirectML</title>
+  <desc id="desc">
+    CPU-trained 6x6x192 val 1.71 at iter 4750 (trusted).
+    DirectML-reported 6x6x384 val 1.47 (untrusted).
+    CPU re-eval of those DirectML weights 5.86 (trusted).
+    Not a per-iter training curve; only retained endpoints.
+  </desc>
+  <rect width="840" height="460" fill="#f7f7f5"/>
+  <text x="28" y="36" font-family="Georgia, serif" font-size="20" fill="#1a1a1a">NanoGPT eval artifact (not a full train curve)</text>
+  <text x="28" y="58" font-family="system-ui, sans-serif" font-size="12" fill="#444444">CPU 6󬝭92 endpoint from PR #6 / local out_cpu/ckpt.pt. DirectML 6󬝯84 numbers are a contrast only  DML val is not ground truth.</text>
+
+  <!-- y axis 0..6.5 -->
+  <line x1="90" y1="90" x2="90" y2="360" stroke="#333" stroke-width="1.5"/>
+  <line x1="90" y1="360" x2="800" y2="360" stroke="#333" stroke-width="1.5"/>
+  <text x="22" y="230" font-family="system-ui, sans-serif" font-size="12" fill="#333" transform="rotate(-90 22 230)">val loss</text>
+
+  <!-- ticks -->
+  <text x="78" y="364" text-anchor="end" font-family="system-ui, sans-serif" font-size="11" fill="#333">0</text>
+  <text x="78" y="274" text-anchor="end" font-family="system-ui, sans-serif" font-size="11" fill="#333">2</text>
+  <line x1="86" y1="270" x2="90" y2="270" stroke="#333"/>
+  <text x="78" y="184" text-anchor="end" font-family="system-ui, sans-serif" font-size="11" fill="#333">4</text>
+  <line x1="86" y1="180" x2="90" y2="180" stroke="#333"/>
+  <text x="78" y="94" text-anchor="end" font-family="system-ui, sans-serif" font-size="11" fill="#333">6</text>
+  <line x1="86" y1="90" x2="90" y2="90" stroke="#333"/>
+
+  <!-- scale: y = 360 - val * 45  (6.0 -> 90) -->
+  <!-- CPU 1.709 -> 360-76.9 = 283.1, height 76.9 -->
+  <rect x="160" y="283.1" width="120" height="76.9" fill="#2f6f4e"/>
+  <text x="220" y="275" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="600" fill="#2f6f4e">1.71</text>
+  <text x="220" y="380" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#1a1a1a">CPU-trained</text>
+  <text x="220" y="396" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#555">6󬝭92 @ 4750</text>
+  <text x="220" y="410" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#2f6f4e">trusted</text>
+
+  <!-- DML reported 1.4659 -> 360-66.0 = 294, height 66 -->
+  <rect x="360" y="294.0" width="120" height="66.0" fill="#b45309"/>
+  <text x="420" y="286" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="600" fill="#b45309">1.47</text>
+  <text x="420" y="380" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#1a1a1a">DirectML reported</text>
+  <text x="420" y="396" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#555">6󬝯84 live eval</text>
+  <text x="420" y="410" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#b45309">untrusted</text>
+
+  <!-- CPU reeval 5.8566 -> 360-263.5 = 96.5, height 263.5 -->
+  <rect x="560" y="96.5" width="120" height="263.5" fill="#1d4ed8"/>
+  <text x="620" y="88" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="600" fill="#1d4ed8">5.86</text>
+  <text x="620" y="380" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#1a1a1a">CPU re-eval of</text>
+  <text x="620" y="396" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#555">those DML weights</text>
+  <text x="620" y="410" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#1d4ed8">trusted</text>
+
+  <text x="28" y="444" font-family="system-ui, sans-serif" font-size="11" fill="#555">Source: results/train_run.json (PR #6 / 5d3d217). See results/directml.md. Always re-eval on CPU.</text>
+</svg>

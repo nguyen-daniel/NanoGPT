@@ -135,6 +135,7 @@ def make_checkpoint(
     seed,
     tokenizer_type,
     argv=None,
+    vocab=None,
 ):
     """Build the dict written to out/ckpt.pt (weights + optimizer + run metadata)."""
     checkpoint = {
@@ -146,6 +147,10 @@ def make_checkpoint(
         "scaler": scaler.state_dict() if scaler is not None else None,
     }
     checkpoint.update(collect_run_metadata(seed, tokenizer_type, argv=argv))
+    # Char vocab must live in the ckpt: current data/vocab.pt is 66 (UNK) and
+    # older Tiny Shakespeare runs used 65. sample.py prefers this list.
+    if vocab is not None:
+        checkpoint["vocab"] = list(vocab)
     return checkpoint
 
 
@@ -216,6 +221,114 @@ def estimate_loss(
     return out
 
 
+def _eval_tensors_for_checkpoint(checkpoint, tokenizer, data_dir, train_split=0.9):
+    """
+    Load train/val token tensors that match the checkpoint's vocab.
+
+    Current CharTokenizer.train() adds UNK (vocab 66). Older Tiny Shakespeare
+    checkpoints used 65 chars and a different id map — data/train.pt from a
+    66-char prepare is not valid for those weights.
+    """
+    data_path = Path(data_dir)
+    ckpt_vocab = checkpoint.get("vocab")
+    disk_vocab = None
+    if (data_path / "vocab.pt").exists():
+        disk_meta = torch.load(data_path / "vocab.pt", map_location="cpu", weights_only=False)
+        disk_vocab = disk_meta.get("vocab")
+        same_size = disk_meta.get("vocab_size") == checkpoint["config"].vocab_size
+        same_list = ckpt_vocab is None or disk_vocab == ckpt_vocab
+        if (
+            same_size
+            and same_list
+            and (data_path / "train.pt").exists()
+            and (data_path / "val.pt").exists()
+        ):
+            return (
+                torch.load(data_path / "train.pt", map_location="cpu", weights_only=False),
+                torch.load(data_path / "val.pt", map_location="cpu", weights_only=False),
+            )
+
+    text_path = data_path / "input.txt"
+    if not text_path.exists():
+        raise FileNotFoundError(
+            f"Cannot build eval tensors for this checkpoint: {text_path} is missing "
+            "and data/train.pt does not match the checkpoint vocab. "
+            "Run data.py or pass a data_dir that has input.txt."
+        )
+    text = text_path.read_text(encoding="utf-8")
+    tokens = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    split_idx = int(train_split * len(tokens))
+    if ckpt_vocab is not None and disk_vocab is not None and ckpt_vocab != disk_vocab:
+        print(
+            "Re-encoded input.txt with the checkpoint vocab "
+            f"(ckpt {len(ckpt_vocab)} chars vs data/vocab.pt {len(disk_vocab)})."
+        )
+    return tokens[:split_idx], tokens[split_idx:]
+
+
+def eval_checkpoint(
+    checkpoint_path,
+    data_dir="data",
+    eval_device="cpu",
+    eval_iters=20,
+    batch_size=32,
+    train_split=0.9,
+):
+    """
+    Score a checkpoint on eval_device (prefer CPU).
+
+    DirectML-reported val loss has been untrustworthy on this Windows + AMD
+    stack — see results/directml.md. This path always builds a fresh model on
+    eval_device from the saved state_dict.
+    """
+    from sample import load_tokenizer_for_checkpoint, model_from_checkpoint, read_checkpoint
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    info = detect_device(eval_device)
+    report_device(info)
+    if info.backend == "directml":
+        print(
+            "Warning: scoring on DirectML. Reported DML val is not ground truth; "
+            "re-run with --eval_device cpu."
+        )
+
+    checkpoint = read_checkpoint(checkpoint_path)
+    tokenizer = load_tokenizer_for_checkpoint(checkpoint, data_dir)
+    model, config = model_from_checkpoint(checkpoint, info.device)
+    train_data, val_data = _eval_tensors_for_checkpoint(
+        checkpoint, tokenizer, data_dir, train_split=train_split
+    )
+    try:
+        train_data = train_data.to(info.device)
+        val_data = val_data.to(info.device)
+    except Exception as exc:
+        print(f"Warning: could not move eval tensors to {info.device}: {exc}")
+
+    block_size = config.block_size
+    losses = estimate_loss(
+        model,
+        train_data,
+        val_data,
+        block_size,
+        min(batch_size, 32),
+        eval_iters,
+        info.device,
+        use_amp=False,
+    )
+    ckpt_best = checkpoint.get("best_val_loss")
+    print(
+        f"CPU-eval path on {info.backend} ({info.name}): "
+        f"train {losses['train']:.4f} | val {losses['val']:.4f}"
+        + (f" | ckpt best_val_loss {ckpt_best:.4f}" if ckpt_best is not None else "")
+    )
+    if info.backend != "cpu":
+        print("Treat this as a device-side number, not a CPU re-eval.")
+    return losses
+
+
 def train(
     data_dir='data',
     block_size=256,
@@ -241,6 +354,7 @@ def train(
     dropout=0.1,
     grad_clip=1.0,
     weight_decay=0.1,
+    cpu_eval=False,
 ):
     """
     Main training function.
@@ -270,6 +384,7 @@ def train(
         dropout: Dropout probability for embeddings, attention, and MLP
         grad_clip: Max gradient norm; 0 disables clipping
         weight_decay: AdamW decay for matmul weights (norms/biases/embeddings use 0)
+        cpu_eval: After training, re-score the saved checkpoint on CPU
     """
     set_seed(seed)
     info = detect_device(device)
@@ -296,6 +411,7 @@ def train(
         val_data = data_dict['val_data']
         vocab_size = data_dict['vocab_size']
         tokenizer_type = data_dict['tokenizer'].type
+        vocab_list = getattr(data_dict['tokenizer'], 'vocab', None)
     else:
         print("Loading preprocessed data...")
         train_data = torch.load(data_path / 'train.pt')
@@ -303,6 +419,7 @@ def train(
         vocab_metadata = torch.load(data_path / 'vocab.pt')
         vocab_size = vocab_metadata['vocab_size']
         tokenizer_type = vocab_metadata.get('tokenizer_type', 'char')
+        vocab_list = vocab_metadata.get('vocab')
 
     # Keep tokens on the training device so get_batch() is a GPU gather,
     # not a Python loop + H2D copy. Tiny Shakespeare fits in a few MB.
@@ -507,6 +624,7 @@ def train(
                     scaler,
                     seed,
                     tokenizer_type,
+                    vocab=vocab_list,
                 )
                 checkpoint_path = Path(out_dir) / 'ckpt.pt'
                 torch.save(checkpoint, checkpoint_path)
@@ -524,6 +642,19 @@ def train(
     print(f"Checkpoint saved to: {Path(out_dir) / 'ckpt.pt'}")
     if writer is not None:
         print(f"TensorBoard logs saved to: {Path(out_dir) / 'runs'}")
+    if cpu_eval:
+        ckpt_path = Path(out_dir) / "ckpt.pt"
+        if ckpt_path.exists():
+            print("\nCPU re-eval of saved checkpoint (DirectML val is not ground truth):")
+            eval_checkpoint(
+                ckpt_path,
+                data_dir=data_dir,
+                eval_device="cpu",
+                eval_iters=min(eval_iters, 20),
+                batch_size=min(batch_size, 32),
+            )
+        else:
+            print("CPU re-eval skipped (no checkpoint written).")
 
 
 if __name__ == '__main__':
@@ -620,8 +751,41 @@ if __name__ == '__main__':
         action='store_true',
         help='Enable gradient checkpointing (trades compute for ~50%% memory reduction)',
     )
+    parser.add_argument(
+        '--eval_only',
+        action='store_true',
+        help='Score a checkpoint and exit (no training). Prefer --eval_device cpu.',
+    )
+    parser.add_argument(
+        '--eval_device',
+        type=str,
+        default=None,
+        help='Device for --eval_only (default: cpu). DirectML val is not ground truth.',
+    )
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default=None,
+        help='Checkpoint path for --eval_only (default: out_dir/ckpt.pt)',
+    )
+    parser.add_argument(
+        '--cpu_eval',
+        action='store_true',
+        help='After training, re-eval the saved checkpoint on CPU',
+    )
 
     args = parser.parse_args()
+
+    if args.eval_only:
+        ckpt = args.checkpoint or str(Path(args.out_dir) / 'ckpt.pt')
+        eval_checkpoint(
+            ckpt,
+            data_dir=args.data_dir,
+            eval_device=args.eval_device or 'cpu',
+            eval_iters=args.eval_iters,
+            batch_size=args.batch_size,
+        )
+        raise SystemExit(0)
 
     # Training hyperparameters
     train(
@@ -649,4 +813,5 @@ if __name__ == '__main__':
         dropout=args.dropout,
         grad_clip=args.grad_clip,
         weight_decay=args.weight_decay,
+        cpu_eval=args.cpu_eval,
     )

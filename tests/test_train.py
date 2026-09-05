@@ -9,7 +9,14 @@ import torch
 
 from model import GPT, GPTConfig, strip_orig_mod_prefix
 from sample import load_checkpoint
-from train import collect_run_metadata, configure_optimizer, get_batch, get_lr, make_checkpoint
+from train import (
+    collect_run_metadata,
+    configure_optimizer,
+    eval_checkpoint,
+    get_batch,
+    get_lr,
+    make_checkpoint,
+)
 
 
 class TestGetBatch(unittest.TestCase):
@@ -97,6 +104,7 @@ class TestCheckpointRoundtrip(unittest.TestCase):
             seed=1337,
             tokenizer_type="char",
             argv=argv,
+            vocab=["a", "b", "c"],
         )
         self.assertEqual(ckpt["iter_num"], 7)
         self.assertEqual(ckpt["best_val_loss"], 2.5)
@@ -106,6 +114,7 @@ class TestCheckpointRoundtrip(unittest.TestCase):
         self.assertEqual(ckpt["argv"], argv)
         self.assertTrue(ckpt["git_sha"] is None or isinstance(ckpt["git_sha"], str))
         self.assertIsNone(ckpt["scaler"])
+        self.assertEqual(ckpt["vocab"], ["a", "b", "c"])
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ckpt.pt"
@@ -206,11 +215,25 @@ class TestTrainSavesMetadata(unittest.TestCase):
             self.assertEqual(ckpt["config"].dropout, 0.0)
             self.assertIn("argv", ckpt)
             self.assertTrue(ckpt["git_sha"] is None or isinstance(ckpt["git_sha"], str))
+            self.assertIn("vocab", ckpt)
+            self.assertEqual(len(ckpt["vocab"]), ckpt["config"].vocab_size)
             loaded, _cfg = load_checkpoint(ckpt_path, torch.device("cpu"))
             idx = torch.randint(0, ckpt["config"].vocab_size, (1, 4))
             with torch.no_grad():
                 out = loaded.generate(idx, max_new_tokens=3)
             self.assertEqual(out.shape, (1, 7))
+
+            losses = eval_checkpoint(
+                ckpt_path,
+                data_dir=str(data_dir),
+                eval_device="cpu",
+                eval_iters=1,
+                batch_size=2,
+            )
+            self.assertIn("train", losses)
+            self.assertIn("val", losses)
+            self.assertTrue(math.isfinite(losses["val"]))
+            self.assertGreater(losses["val"], 0.0)
 
 
 def _tiny_corpus_dirs(td: Path):

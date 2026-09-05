@@ -8,7 +8,7 @@ import torch
 
 from data import prepare_data
 from model import GPT, GPTConfig, filter_logits
-from sample import generate_text, load_checkpoint
+from sample import generate_text, load_checkpoint, load_tokenizer_for_checkpoint
 from train import make_checkpoint
 
 
@@ -83,6 +83,45 @@ class TestSample(unittest.TestCase):
             self.assertIsInstance(text, str)
             self.assertGreater(len(text), 0)
             self.assertTrue(text.startswith("h"))
+
+    def test_checkpoint_vocab_preferred_over_mismatched_data(self):
+        """65-char ckpt vocab must win over a 66+UNK data/vocab.pt."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src = root / "corpus.txt"
+            src.write_text(CORPUS, encoding="utf-8")
+            data_dir = root / "data"
+            prepared = prepare_data(
+                data_dir=str(data_dir),
+                input_file=str(src),
+                tokenizer_type="char",
+                train_split=0.9,
+            )
+            ckpt_vocab = [ch for ch in prepared["tokenizer"].vocab if ch != "\0"]
+            config = GPTConfig(
+                block_size=12,
+                vocab_size=len(ckpt_vocab),
+                n_layer=1,
+                n_head=2,
+                n_embd=16,
+                dropout=0.0,
+            )
+            model = GPT(config)
+            ckpt = make_checkpoint(
+                model,
+                torch.optim.AdamW(model.parameters(), lr=1e-3),
+                config,
+                iter_num=0,
+                best_val_loss=1.0,
+                scaler=None,
+                seed=0,
+                tokenizer_type="char",
+                vocab=ckpt_vocab,
+            )
+            tok = load_tokenizer_for_checkpoint(ckpt, str(data_dir))
+            self.assertEqual(tok.vocab_size, len(ckpt_vocab))
+            self.assertEqual(tok.vocab, ckpt_vocab)
+            self.assertNotEqual(tok.vocab_size, prepared["tokenizer"].vocab_size)
 
 
 class TestTopKTopP(unittest.TestCase):

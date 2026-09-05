@@ -1,0 +1,22 @@
+{
+  "corpus": "Tiny Shakespeare",
+  "path": "data\\input.txt",
+  "characters": 1115394,
+  "utf8_bytes": 1115394,
+  "char_tokenizer": {
+    "vocab_size": 65,
+    "tokens": 1115394,
+    "tokens_per_char": 1.0
+  },
+  "bpe_tokenizer": {
+    "vocab_size": 1000,
+    "target_vocab_size": 1000,
+    "tokens": 447069
+  },
+  "compression_ratio_vs_char": 2.494903471276246,
+  "compression_ratio_vs_utf8_bytes": 2.494903471276246,
+  "resume_claim": "2–4x sequence compression vs char",
+  "claim_met": true,
+  "source": "PR #6 / commit 5d3d217, python benches/bench_bpe.py --vocab_size 1000",
+  "note": "Measured on this project before CharTokenizer added UNK. Current CharTokenizer.train() is 66 (NUL + 65 Shakespeare chars). Compression is vs character count, so the 2.49x ratio does not depend on that extra UNK id."
+}
