@@ -10,12 +10,19 @@ import torch
 from model import GPT, GPTConfig, strip_orig_mod_prefix
 from sample import load_checkpoint
 from train import (
+    BEST_CKPT_NAME,
+    LAST_CKPT_NAME,
+    apply_optimizer_step,
+    atomic_torch_save,
     collect_run_metadata,
     configure_optimizer,
     eval_checkpoint,
     get_batch,
     get_lr,
     make_checkpoint,
+    micro_batch_backward,
+    persist_training_checkpoints,
+    resume_checkpoint_path,
 )
 
 
@@ -115,6 +122,7 @@ class TestCheckpointRoundtrip(unittest.TestCase):
         self.assertTrue(ckpt["git_sha"] is None or isinstance(ckpt["git_sha"], str))
         self.assertIsNone(ckpt["scaler"])
         self.assertEqual(ckpt["vocab"], ["a", "b", "c"])
+        self.assertEqual(ckpt["grad_accum_steps"], 1)
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "ckpt.pt"
@@ -217,6 +225,8 @@ class TestTrainSavesMetadata(unittest.TestCase):
             self.assertTrue(ckpt["git_sha"] is None or isinstance(ckpt["git_sha"], str))
             self.assertIn("vocab", ckpt)
             self.assertEqual(len(ckpt["vocab"]), ckpt["config"].vocab_size)
+            self.assertEqual(ckpt["grad_accum_steps"], 1)
+            self.assertTrue((out_dir / LAST_CKPT_NAME).exists())
             loaded, _cfg = load_checkpoint(ckpt_path, torch.device("cpu"))
             idx = torch.randint(0, ckpt["config"].vocab_size, (1, 4))
             with torch.no_grad():
@@ -318,21 +328,37 @@ class TestResume(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             data_dir, out_dir = _tiny_corpus_dirs(Path(td))
             train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=2))
-            ckpt_path = out_dir / "ckpt.pt"
-            self.assertTrue(ckpt_path.exists())
-            first = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            last_path = out_dir / LAST_CKPT_NAME
+            self.assertTrue(last_path.exists())
+            first = torch.load(last_path, map_location="cpu", weights_only=False)
             first_iter = first["iter_num"]
             first_weights = {k: v.clone() for k, v in first["model"].items()}
-            # Tiny runs may not beat the saved val loss; force the next eval to write.
-            first["best_val_loss"] = float("inf")
-            torch.save(first, ckpt_path)
 
             train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=4, resume=True))
-            second = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            second = torch.load(last_path, map_location="cpu", weights_only=False)
             self.assertGreater(second["iter_num"], first_iter)
             self.assertFalse(
                 all(torch.equal(first_weights[k], second["model"][k]) for k in first_weights)
             )
+
+    def test_resume_prefers_last_over_stale_best(self):
+        from train import train
+
+        with tempfile.TemporaryDirectory() as td:
+            data_dir, out_dir = _tiny_corpus_dirs(Path(td))
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=2))
+            last_path = out_dir / LAST_CKPT_NAME
+            best_path = out_dir / BEST_CKPT_NAME
+            first_last = torch.load(last_path, map_location="cpu", weights_only=False)
+            stale_best = torch.load(best_path, map_location="cpu", weights_only=False)
+            # If --resume loaded best, start_iter would be 1001 and max_iters=4 is a no-op.
+            stale_best["iter_num"] = 1000
+            torch.save(stale_best, best_path)
+
+            train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=4, resume=True))
+            resumed = torch.load(last_path, map_location="cpu", weights_only=False)
+            self.assertGreater(resumed["iter_num"], first_last["iter_num"])
+            self.assertLess(resumed["iter_num"], 1000)
 
 
 class TestOrigModStrip(unittest.TestCase):
@@ -406,10 +432,130 @@ class TestOrigModStrip(unittest.TestCase):
             ckpt["model"] = {f"_orig_mod.{k}": v for k, v in ckpt["model"].items()}
             ckpt["best_val_loss"] = float("inf")
             torch.save(ckpt, ckpt_path)
+            torch.save(ckpt, out_dir / LAST_CKPT_NAME)
             train(**_tiny_train_kwargs(data_dir, out_dir, max_iters=3, resume=True))
-            resumed = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            resumed = torch.load(out_dir / LAST_CKPT_NAME, map_location="cpu", weights_only=False)
             self.assertFalse(any(k.startswith("_orig_mod.") for k in resumed["model"]))
             self.assertGreaterEqual(resumed["iter_num"], ckpt["iter_num"])
+
+
+class TestAtomicCheckpoints(unittest.TestCase):
+    def test_atomic_save_replaces_and_leaves_no_tmp(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            atomic_torch_save({"x": 1}, path)
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_name("ckpt.pt.tmp").exists())
+            self.assertEqual(torch.load(path, map_location="cpu", weights_only=False)["x"], 1)
+            atomic_torch_save({"x": 2}, path)
+            self.assertEqual(torch.load(path, map_location="cpu", weights_only=False)["x"], 2)
+
+    def test_resume_path_prefers_last_then_best(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            self.assertIsNone(resume_checkpoint_path(out))
+            torch.save({"k": "best"}, out / BEST_CKPT_NAME)
+            self.assertEqual(resume_checkpoint_path(out).name, BEST_CKPT_NAME)
+            torch.save({"k": "last"}, out / LAST_CKPT_NAME)
+            self.assertEqual(resume_checkpoint_path(out).name, LAST_CKPT_NAME)
+
+    def test_persist_writes_last_always_and_best_when_improved(self):
+        with tempfile.TemporaryDirectory() as td:
+            persist_training_checkpoints({"iter_num": 1}, td, is_best=False)
+            self.assertTrue((Path(td) / LAST_CKPT_NAME).exists())
+            self.assertFalse((Path(td) / BEST_CKPT_NAME).exists())
+            persist_training_checkpoints({"iter_num": 2}, td, is_best=True)
+            self.assertEqual(
+                torch.load(Path(td) / BEST_CKPT_NAME, map_location="cpu", weights_only=False)[
+                    "iter_num"
+                ],
+                2,
+            )
+            persist_training_checkpoints({"iter_num": 3}, td, is_best=False)
+            self.assertEqual(
+                torch.load(Path(td) / LAST_CKPT_NAME, map_location="cpu", weights_only=False)[
+                    "iter_num"
+                ],
+                3,
+            )
+            self.assertEqual(
+                torch.load(Path(td) / BEST_CKPT_NAME, map_location="cpu", weights_only=False)[
+                    "iter_num"
+                ],
+                2,
+            )
+
+
+class TestGradAccum(unittest.TestCase):
+    def _tiny_config(self):
+        return GPTConfig(
+            block_size=8,
+            vocab_size=16,
+            n_layer=1,
+            n_head=2,
+            n_embd=16,
+            dropout=0.0,
+            use_sdpa=True,
+        )
+
+    def test_accumulated_grads_match_mean_microbatch(self):
+        torch.manual_seed(0)
+        config = self._tiny_config()
+        model_a = GPT(config)
+        model_b = GPT(config)
+        model_b.load_state_dict(model_a.state_dict())
+
+        x1 = torch.randint(0, config.vocab_size, (2, config.block_size))
+        y1 = torch.randint(0, config.vocab_size, (2, config.block_size))
+        x2 = torch.randint(0, config.vocab_size, (2, config.block_size))
+        y2 = torch.randint(0, config.vocab_size, (2, config.block_size))
+
+        model_a.zero_grad(set_to_none=True)
+        micro_batch_backward(model_a, x1, y1, scaler=None, amp_ok=False, accum_scale=2)
+        micro_batch_backward(model_a, x2, y2, scaler=None, amp_ok=False, accum_scale=2)
+
+        model_b.zero_grad(set_to_none=True)
+        _, loss1 = model_b(x1, y1)
+        _, loss2 = model_b(x2, y2)
+        ((loss1 + loss2) / 2).backward()
+
+        for (name, p_a), (_, p_b) in zip(model_a.named_parameters(), model_b.named_parameters()):
+            if p_a.grad is None and p_b.grad is None:
+                continue
+            self.assertIsNotNone(p_a.grad, name)
+            self.assertIsNotNone(p_b.grad, name)
+            self.assertTrue(torch.allclose(p_a.grad, p_b.grad, atol=1e-5, rtol=1e-4), name)
+
+    def test_apply_optimizer_step_updates_and_zeros(self):
+        torch.manual_seed(1)
+        config = self._tiny_config()
+        model = GPT(config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        x = torch.randint(0, config.vocab_size, (2, config.block_size))
+        y = torch.randint(0, config.vocab_size, (2, config.block_size))
+        before = {k: v.clone() for k, v in model.state_dict().items()}
+        micro_batch_backward(model, x, y, scaler=None, amp_ok=False, accum_scale=1)
+        self.assertTrue(
+            any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+        )
+        apply_optimizer_step(model, optimizer, scaler=None, grad_clip=1.0)
+        after = model.state_dict()
+        self.assertFalse(all(torch.equal(before[k], after[k]) for k in before))
+        self.assertTrue(all(p.grad is None for p in model.parameters()))
+
+    def test_tiny_train_grad_accum_writes_last(self):
+        from train import train
+
+        with tempfile.TemporaryDirectory() as td:
+            data_dir, out_dir = _tiny_corpus_dirs(Path(td))
+            train(
+                **_tiny_train_kwargs(
+                    data_dir, out_dir, max_iters=2, eval_interval=1, grad_accum_steps=2
+                )
+            )
+            last = torch.load(out_dir / LAST_CKPT_NAME, map_location="cpu", weights_only=False)
+            self.assertEqual(last["grad_accum_steps"], 2)
+            self.assertTrue((out_dir / BEST_CKPT_NAME).exists())
 
 
 if __name__ == "__main__":

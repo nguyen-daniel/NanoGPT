@@ -33,7 +33,9 @@ That checkpoint stores its own 65-char vocab (Tiny Shakespeare **before** UNK). 
 - Vectorized `get_batch()` with optional device-resident tokens (no Python index loop)
 - Character tokenizer by default (unknown chars map to UNK); optional BPE (`python data.py --tokenizer bpe`)
 - Dropout on `GPTConfig` (`--dropout`, default 0.1); AdamW decay vs no-decay groups; `--grad_clip` (default 1.0)
+- `--grad_accum N`: N micro-batches per optimizer step (effective batch = `batch_size * N`) so CPU/DirectML can train a larger batch without OOM
 - `ckpt.pt` stores tokenizer type, seed, torch version, git SHA, full argv, and the char `vocab` list (65 vs 66+UNK compatibility)
+- Crash-safe checkpoints: atomic `os.replace` writes; `ckpt_last.pt` on every eval (and on Ctrl-C) so `--resume` continues after a crash even if val did not improve; `ckpt.pt` is still the best-val snapshot used by `sample.py`
 
 ## Train from scratch
 
@@ -43,6 +45,8 @@ pip install -r requirements.txt
 
 python data.py
 python train.py --max_iters 50 --eval_interval 50 --eval_iters 2 --no_amp --no_compile
+# larger effective batch on CPU without raising --batch_size:
+# python train.py --batch_size 8 --grad_accum 8 --no_amp --no_compile
 python sample.py --prompt "ROMEO:"
 python -m unittest discover -s tests -v
 # lint (optional): pip install ruff && ruff format --check . && ruff check .
@@ -102,7 +106,7 @@ Device proof measured on **AMD Radeon RX 7800 XT** (Windows, **DirectML** — no
 | Size | Default 6×6×384 is ~10–15M parameters (vocab-dependent); printed at train start | train log |
 | BPE | 2.49× sequence compression vs char on Tiny Shakespeare (vocab 1000) | `python benches/bench_bpe.py` → `results/bpe_compression.json` |
 | Batching | Vectorized gather; optional device-resident tokens | `get_batch()` vs `get_batch_loop()` in `train.py` |
-| Train loop | `get_batch` / `get_lr` / checkpoint roundtrip / `--resume` / `_orig_mod` strip / `prepare_data` / sample generate + top-k/top-p / CPU-eval / demo download | `tests/test_train.py`, `tests/test_data.py`, `tests/test_sample.py`, `tests/test_download_demo_ckpt.py` |
+| Train loop | `get_batch` / `get_lr` / checkpoint roundtrip / `--resume` from `ckpt_last.pt` / atomic saves / `--grad_accum` / `_orig_mod` strip / `prepare_data` / sample generate + top-k/top-p / CPU-eval / demo download | `tests/test_train.py`, `tests/test_data.py`, `tests/test_sample.py`, `tests/test_download_demo_ckpt.py` |
 
 No 2–4× memory or 40% data-loading claims, and no 100 iter/s or &lt;10ms/token claims. If you run `make bench`, treat the JSON as the only numbers.
 

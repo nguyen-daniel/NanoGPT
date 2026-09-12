@@ -125,6 +125,10 @@ def collect_run_metadata(seed, tokenizer_type, argv=None):
     }
 
 
+BEST_CKPT_NAME = "ckpt.pt"
+LAST_CKPT_NAME = "ckpt_last.pt"
+
+
 def make_checkpoint(
     model,
     optimizer,
@@ -136,6 +140,7 @@ def make_checkpoint(
     tokenizer_type,
     argv=None,
     vocab=None,
+    grad_accum_steps=1,
 ):
     """Build the dict written to out/ckpt.pt (weights + optimizer + run metadata)."""
     checkpoint = {
@@ -145,6 +150,7 @@ def make_checkpoint(
         "iter_num": iter_num,
         "best_val_loss": best_val_loss,
         "scaler": scaler.state_dict() if scaler is not None else None,
+        "grad_accum_steps": grad_accum_steps,
     }
     checkpoint.update(collect_run_metadata(seed, tokenizer_type, argv=argv))
     # Char vocab must live in the ckpt: current data/vocab.pt is 66 (UNK) and
@@ -152,6 +158,85 @@ def make_checkpoint(
     if vocab is not None:
         checkpoint["vocab"] = list(vocab)
     return checkpoint
+
+
+def atomic_torch_save(obj, path):
+    """
+    Pickle to a sibling .tmp file, then os.replace onto `path`.
+
+    A kill during torch.save(dest) can leave a truncated checkpoint that
+    --resume cannot load. replace() is atomic on POSIX and on Windows when
+    both paths are on the same volume.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        torch.save(obj, tmp)
+        os.replace(tmp, path)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def resume_checkpoint_path(out_dir):
+    """
+    Path --resume should load.
+
+    Prefer ckpt_last.pt (latest optimizer step) so a crash after a val plateau
+    still has weights. Fall back to ckpt.pt for older runs that only saved best.
+    """
+    out = Path(out_dir)
+    last = out / LAST_CKPT_NAME
+    best = out / BEST_CKPT_NAME
+    if last.exists():
+        return last
+    if best.exists():
+        return best
+    return None
+
+
+def persist_training_checkpoints(checkpoint, out_dir, is_best):
+    """Always update ckpt_last.pt; also write ckpt.pt when validation improves."""
+    out = Path(out_dir)
+    last_path = out / LAST_CKPT_NAME
+    atomic_torch_save(checkpoint, last_path)
+    if is_best:
+        atomic_torch_save(checkpoint, out / BEST_CKPT_NAME)
+    return last_path
+
+
+def micro_batch_backward(model, x, y, scaler, amp_ok, accum_scale):
+    """
+    One micro-batch forward + backward. Loss is divided by accum_scale so N
+    micro-batches average to the same gradient as a mean over the tokens.
+    """
+    if amp_ok and scaler is not None:
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            _, loss = model(x, y)
+            loss = loss / accum_scale
+        scaler.scale(loss).backward()
+    else:
+        _, loss = model(x, y)
+        loss = loss / accum_scale
+        loss.backward()
+    return loss.detach() * accum_scale
+
+
+def apply_optimizer_step(model, optimizer, scaler, grad_clip):
+    """Clip (optional), optimizer step, scaler update, then zero grads."""
+    if scaler is not None:
+        if grad_clip > 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        if grad_clip > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
 
 
 def get_lr(it, learning_rate, warmup_iters, max_iters, min_lr):
@@ -355,6 +440,7 @@ def train(
     grad_clip=1.0,
     weight_decay=0.1,
     cpu_eval=False,
+    grad_accum_steps=1,
 ):
     """
     Main training function.
@@ -385,7 +471,11 @@ def train(
         grad_clip: Max gradient norm; 0 disables clipping
         weight_decay: AdamW decay for matmul weights (norms/biases/embeddings use 0)
         cpu_eval: After training, re-score the saved checkpoint on CPU
+        grad_accum_steps: Micro-batches per optimizer step (effective batch =
+            batch_size * grad_accum_steps). max_iters counts optimizer steps.
     """
+    if grad_accum_steps < 1:
+        raise ValueError(f"grad_accum_steps must be >= 1, got {grad_accum_steps}")
     set_seed(seed)
     info = detect_device(device)
     report_device(info)
@@ -510,8 +600,8 @@ def train(
     best_val_loss = float('inf')
 
     if resume:
-        checkpoint_path = Path(out_dir) / 'ckpt.pt'
-        if checkpoint_path.exists():
+        checkpoint_path = resume_checkpoint_path(out_dir)
+        if checkpoint_path is not None:
             print(f"\nResuming from checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -543,14 +633,20 @@ def train(
             print(f"  Resumed at iteration {start_iter}")
             print(f"  Best validation loss so far: {best_val_loss:.4f}")
         else:
-            print(f"\nWarning: --resume specified but no checkpoint found at {checkpoint_path}")
+            last_p = Path(out_dir) / LAST_CKPT_NAME
+            best_p = Path(out_dir) / BEST_CKPT_NAME
+            print(f"\nWarning: --resume specified but no checkpoint at {last_p} or {best_p}")
             print("  Starting training from scratch...")
 
     # Training loop
     print(f"\nStarting training on {device_str} ({info.name})...")
-    print(f"Max iterations: {max_iters}")
+    print(f"Max iterations: {max_iters} (optimizer steps)")
     print(f"Warmup iterations: {warmup_iters}")
     print(f"Evaluation interval: {eval_interval} iterations")
+    print(
+        f"Gradient accumulation: {grad_accum_steps} micro-batch(es); "
+        f"effective batch size {batch_size * grad_accum_steps}"
+    )
     if amp_ok:
         gpu_type = "AMD GPU (ROCm)" if is_amd_gpu else "NVIDIA GPU"
         print(f"Using mixed-precision training (FP16) on {gpu_type}")
@@ -560,77 +656,86 @@ def train(
         print(f"Resuming from iteration {start_iter}")
     print("-" * 60)
 
+    def _snapshot(iter_num, best_val_loss, is_best):
+        checkpoint = make_checkpoint(
+            model,
+            optimizer,
+            config,
+            iter_num,
+            best_val_loss,
+            scaler,
+            seed,
+            tokenizer_type,
+            vocab=vocab_list,
+            grad_accum_steps=grad_accum_steps,
+        )
+        persist_training_checkpoints(checkpoint, out_dir, is_best=is_best)
+
     iter_num = start_iter
+    optimizer.zero_grad(set_to_none=True)
 
-    while iter_num < max_iters:
-        # Update learning rate with warmup and cosine decay
-        lr = get_lr(iter_num, learning_rate, warmup_iters, max_iters, min_lr)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+    try:
+        while iter_num < max_iters:
+            # Update learning rate with warmup and cosine decay
+            lr = get_lr(iter_num, learning_rate, warmup_iters, max_iters, min_lr)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-        # Sample a batch of data
-        x, y = get_batch(train_data, block_size, batch_size, device_obj)
-        if iter_num == start_iter:
-            param_dev = next(model.parameters()).device
-            print(f"Proof: batch x.device={x.device}  model.param.device={param_dev}")
-            if x.device != param_dev:
-                print("Warning: batch and model are on different devices")
-
-        # Forward and backward pass with mixed precision if enabled
-        if amp_ok and scaler is not None:
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                logits, loss = model(x, y)
-
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            if grad_clip > 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            logits, loss = model(x, y)
-            optimizer.zero_grad()
-            loss.backward()
-            if grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-
-        # Evaluate periodically
-        if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-            losses = estimate_loss(
-                model, train_data, val_data, block_size, batch_size, eval_iters, device_obj, amp_ok
-            )
-            current_lr = optimizer.param_groups[0]['lr']
-            print(
-                f"iter {iter_num:5d} | lr {current_lr:.2e} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}"
-            )
-
-            # Log to TensorBoard
-            if writer is not None:
-                writer.add_scalar('Loss/train', losses['train'], iter_num)
-                writer.add_scalar('Loss/val', losses['val'], iter_num)
-                writer.add_scalar('LearningRate', current_lr, iter_num)
-
-            # Save checkpoint if validation loss improved
-            if losses['val'] < best_val_loss:
-                best_val_loss = losses['val']
-                checkpoint = make_checkpoint(
-                    model,
-                    optimizer,
-                    config,
-                    iter_num,
-                    best_val_loss,
-                    scaler,
-                    seed,
-                    tokenizer_type,
-                    vocab=vocab_list,
+            last_loss = None
+            for micro in range(grad_accum_steps):
+                x, y = get_batch(train_data, block_size, batch_size, device_obj)
+                if iter_num == start_iter and micro == 0:
+                    param_dev = next(model.parameters()).device
+                    print(f"Proof: batch x.device={x.device}  model.param.device={param_dev}")
+                    if x.device != param_dev:
+                        print("Warning: batch and model are on different devices")
+                last_loss = micro_batch_backward(
+                    model, x, y, scaler, amp_ok, accum_scale=grad_accum_steps
                 )
-                checkpoint_path = Path(out_dir) / 'ckpt.pt'
-                torch.save(checkpoint, checkpoint_path)
-                print(f"  -> Checkpoint saved (val loss: {best_val_loss:.4f})")
 
-        iter_num += 1
+            apply_optimizer_step(model, optimizer, scaler, grad_clip)
+
+            # Evaluate periodically
+            if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+                losses = estimate_loss(
+                    model,
+                    train_data,
+                    val_data,
+                    block_size,
+                    batch_size,
+                    eval_iters,
+                    device_obj,
+                    amp_ok,
+                )
+                current_lr = optimizer.param_groups[0]['lr']
+                print(
+                    f"iter {iter_num:5d} | lr {current_lr:.2e} | "
+                    f"train loss {losses['train']:.4f} | val loss {losses['val']:.4f}"
+                )
+
+                if writer is not None:
+                    writer.add_scalar('Loss/train', losses['train'], iter_num)
+                    writer.add_scalar('Loss/val', losses['val'], iter_num)
+                    writer.add_scalar('LearningRate', current_lr, iter_num)
+                    if last_loss is not None:
+                        writer.add_scalar('Loss/micro_batch', last_loss.item(), iter_num)
+
+                is_best = losses['val'] < best_val_loss
+                if is_best:
+                    best_val_loss = losses['val']
+                _snapshot(iter_num, best_val_loss, is_best=is_best)
+                if is_best:
+                    print(f"  -> ckpt_last.pt + {BEST_CKPT_NAME} (val loss: {best_val_loss:.4f})")
+                else:
+                    print(f"  -> {LAST_CKPT_NAME} saved")
+
+            iter_num += 1
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt: writing ckpt_last.pt so --resume can continue")
+        save_iter = iter_num - 1 if iter_num > start_iter else iter_num
+        _snapshot(save_iter, best_val_loss, is_best=False)
+        print(f"  -> {Path(out_dir) / LAST_CKPT_NAME}")
+        raise
 
     # Close TensorBoard writer
     if writer is not None:
@@ -639,11 +744,12 @@ def train(
     print("\n" + "=" * 60)
     print("Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
-    print(f"Checkpoint saved to: {Path(out_dir) / 'ckpt.pt'}")
+    print(f"Best checkpoint: {Path(out_dir) / BEST_CKPT_NAME}")
+    print(f"Last checkpoint: {Path(out_dir) / LAST_CKPT_NAME}")
     if writer is not None:
         print(f"TensorBoard logs saved to: {Path(out_dir) / 'runs'}")
     if cpu_eval:
-        ckpt_path = Path(out_dir) / "ckpt.pt"
+        ckpt_path = Path(out_dir) / BEST_CKPT_NAME
         if ckpt_path.exists():
             print("\nCPU re-eval of saved checkpoint (DirectML val is not ground truth):")
             eval_checkpoint(
@@ -773,6 +879,12 @@ if __name__ == '__main__':
         action='store_true',
         help='After training, re-eval the saved checkpoint on CPU',
     )
+    parser.add_argument(
+        '--grad_accum',
+        type=int,
+        default=1,
+        help='Micro-batches per optimizer step (default: 1). Effective batch = batch_size * grad_accum.',
+    )
 
     args = parser.parse_args()
 
@@ -814,4 +926,5 @@ if __name__ == '__main__':
         grad_clip=args.grad_clip,
         weight_decay=args.weight_decay,
         cpu_eval=args.cpu_eval,
+        grad_accum_steps=args.grad_accum,
     )
